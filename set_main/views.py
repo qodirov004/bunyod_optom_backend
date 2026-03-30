@@ -84,7 +84,7 @@ class CurrencyRateViewSet(viewsets.ModelViewSet):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
 class DriverViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsOwnerOrCEO]
+    permission_classes = [permissions.AllowAny]
     queryset = models.DriverSalary.objects.select_related('driver', 'currency').all()
     serializer_class = rest_api.DriverSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
