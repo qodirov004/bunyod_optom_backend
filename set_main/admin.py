@@ -60,8 +60,17 @@ class ProductAdmin(ModelAdmin):
     search_fields = ('name', 'furgon_mod__name')
     list_filter = ('price',)
 
-# @admin.register(models.Delivery)
-# class DeliveryAdmin(ModelAdmin):
-#     list_display = ('address', 'product', 'driver', 'give_count', 'sale_count', 'created_at', 'updated_at')
-#     search_fields = ('address', 'product__name', 'driver__username')
-#     list_filter = ('created_at', 'updated_at')
+@admin.register(models.CountryMod)
+class CountryModAdmin(ModelAdmin):
+    list_display = ('name',)
+    search_fields = ('name',)
+
+@admin.register(models.FromLocation)
+class FromLocationAdmin(ModelAdmin):
+    list_display = ('name',)
+    search_fields = ('name',)
+
+@admin.register(models.ToLocation)
+class ToLocationAdmin(ModelAdmin):
+    list_display = ('name',)
+    search_fields = ('name',)

@@ -1028,7 +1028,7 @@ class CountryViewSet(viewsets.ModelViewSet):
         if self.action in ['list', 'retrieve']:
             permission_classes = [permissions.IsAuthenticated]
         else:
-            permission_classes = [IsOwnerOrCEO]
+            permission_classes = [IsBugalterOrAdmin]
         return [permission() for permission in permission_classes]
 
     queryset = models.CountryMod.objects.all()
