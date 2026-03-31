@@ -9,24 +9,30 @@ def to_usd(amount, currency_code):
     """
     Конвертирует сумму из указанной валюты в доллары США.
     """
-    amount = Decimal(amount)
+    try:
+        amount = Decimal(str(amount))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal('0.00')
 
     if currency_code == 'USD':
         return amount
 
     try:
         currency_rate = models.CurrencyRate.objects.get(currency=currency_code)
-    except models.CurrencyRate.DoesNotExist:
-        return Decimal(0)
+        usd_currency = models.CurrencyRate.objects.get(currency='USD')
+        usd_rate = Decimal(str(usd_currency.rate_to_uzs))
+        
+        if usd_rate == 0:
+            return Decimal('0.00')
 
-    if currency_code == 'UZS':
-        usd_rate = models.CurrencyRate.objects.get(currency='USD').rate_to_uzs
-        return amount / usd_rate
+        if currency_code == 'UZS':
+            return amount / usd_rate
 
-    # Конвертировать сначала в UZS, затем в USD
-    uzs_amount = amount * currency_rate.rate_to_uzs
-    usd_rate = models.CurrencyRate.objects.get(currency='USD').rate_to_uzs
-    return uzs_amount / usd_rate
+        # Конвертировать сначала в UZS, затем в USD
+        uzs_amount = amount * Decimal(str(currency_rate.rate_to_uzs))
+        return uzs_amount / usd_rate
+    except (models.CurrencyRate.DoesNotExist, ZeroDivisionError, InvalidOperation):
+        return Decimal('0.00')
             
 class CurrencySerializer(serializers.ModelSerializer):
     class Meta:
@@ -256,28 +262,7 @@ class CashTransactionHistorySerializer(serializers.ModelSerializer):
     def get_driver_name(self, obj):
         return obj.driver.fullname if obj.driver else None
 
-class CustomUserSerializer(serializers.ModelSerializer):
-    token = serializers.SerializerMethodField()
 
-    class Meta:
-        model = models.CustomUser
-        fields = ['id', 'username', 'fullname', 'phone_number', 'status', 'password', 'token']
-        extra_kwargs = {'password': {'write_only': True}}
-
-    def get_token(self, user):
-        refresh = RefreshToken.for_user(user)
-        return {
-            'refresh': str(refresh),
-            'access': str(refresh.access_token)
-        }
-   
-    def create(self, validated_data):
-        password = validated_data.pop('password', None)
-        user = models.CustomUser(**validated_data)
-        if password:
-            user.set_password(password)
-        user.save()
-        return user
     
 class TexnicsSerializer(serializers.ModelSerializer):
     service_name = serializers.CharField(source="service.name", read_only=True)
@@ -356,23 +341,43 @@ def get_driver_total_rays_usd(driver):
             total += float(ray.price)
     return round(total, 2)
 class CustomUserSerializer(serializers.ModelSerializer):
-    rays_count = serializers.IntegerField(read_only=True)
-    total_rays_usd = serializers.DecimalField(max_digits=15, decimal_places=2, read_only=True)
+    rays_count = serializers.SerializerMethodField()
+    total_rays_usd = serializers.SerializerMethodField()
+    token = serializers.SerializerMethodField()
 
     class Meta:
         model = models.CustomUser
         fields = [
             'id', 'username', 'password', 'fullname', 'photo', 'phone_number', 'status', 'date',
             'passport_series', 'passport_number', 'passport_issued_by', 'passport_issued_date',
-            'passport_birth_date', 'passport_photo', 'is_busy', 'rays_count', 'total_rays_usd'
+            'passport_birth_date', 'passport_photo_front', 'passport_photo_back', 
+            'license_number', 'license_expiry', 'is_busy', 'rays_count', 'total_rays_usd', 'token'
         ]
         extra_kwargs = {
             'password': {
                 'write_only': True,
-                'required': False,  # Теперь пароль не обязателен при обновлении
+                'required': False,
                 'allow_blank': False
             }
         }
+
+    def get_token(self, user):
+        refresh = RefreshToken.for_user(user)
+        return {
+            'refresh': str(refresh),
+            'access': str(refresh.access_token)
+        }
+
+    def get_rays_count(self, obj):
+        return models.RaysHistoryMod.objects.filter(driver=obj).count()
+
+    def get_total_rays_usd(self, obj):
+        from .models import RaysHistoryMod
+        total = 0
+        for ray in RaysHistoryMod.objects.filter(driver=obj):
+            if ray.price:
+                total += float(ray.price)
+        return round(total, 2)
 
     def create(self, validated_data):
         password = validated_data.pop('password', None)
@@ -390,8 +395,7 @@ class CustomUserSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
 
         if password:
-            instance.set_password(password)  # Если пароль передан, обновляем его
-
+            instance.set_password(password)
         instance.save()
         return instance
 
@@ -467,7 +471,7 @@ class ProductSerializer(serializers.ModelSerializer):
         fields = '__all__'
     
     def get_currency_name(self, obj):
-        return obj.currency.currency
+        return obj.currency.currency if obj.currency else None
     
     def get_client_name(self, obj):
         return f'{obj.client.first_name} {obj.client.last_name}'
@@ -585,8 +589,8 @@ class ExtendedRaysHistorySerializer(serializers.ModelSerializer):
     class Meta:
         model = models.RaysHistoryMod
         fields = [
-            'id','rays_id', 'country', 'driver', 'car', 'fourgon', 'client',
-            'price', 'dr_price', 'dp_price',
+            'id', 'rays_id', 'country', 'driver', 'car', 'fourgon', 'client',
+            'price', 'dr_price', 'dp_price', 'dp_currency',
             'kilometer', 'dp_information', 'created_at', 'count',
             'expenses'
         ]
@@ -594,6 +598,12 @@ class ExtendedRaysHistorySerializer(serializers.ModelSerializer):
     def get_client(self, obj):
         clients = obj.client.all()
         return ClientWithProductsHistorySerializer(clients, many=True, context={'rays_history': obj}).data
+    
+    def to_representation(self, instance):
+        rep = super().to_representation(instance)
+        # Frontend expects these as objects, but ExtendedRaysHistorySerializer already has them as objects
+        # We just need to make sure the naming matches what the frontend expects if different
+        return rep
 
 class RaysSerializer(serializers.ModelSerializer):
     country_name = serializers.SerializerMethodField()
@@ -621,11 +631,16 @@ class RaysSerializer(serializers.ModelSerializer):
     client_completed_data = SimpleClientSerializer(source='client_completed', many=True, read_only=True)
     class Meta:
         model = models.RaysMod
-        fields = '__all__'
-        extra_fields = ['car_data', 'fourgon_data', 'client_data', 'driver_data', 'expenses']
+        fields = [
+            'id', 'country', 'driver', 'car', 'fourgon', 'client', 'client_completed',
+            'price', 'dr_price', 'dp_price', 'dp_currency',
+            'kilometer', 'dp_information', 'created_at', 'count', 'is_completed',
+            'car_data', 'fourgon_data', 'client_data', 'driver_data', 'client_completed_data', 
+            'expenses', 'country_name', 'dp_currency_name'
+        ]
 
     def get_dp_currency_name(self, obj):
-        return obj.dp_currency.currency
+        return obj.dp_currency.currency if obj.dp_currency else None
 
     def get_client_data(self, obj):
         # Optimized: products are prefetched in the view
@@ -718,14 +733,22 @@ class RaysSerializer(serializers.ModelSerializer):
         if value.is_busy:
             raise serializers.ValidationError("Этот водитель уже участвует в активном рейсе.")
         return value
+
     def to_representation(self, instance):
         rep = super().to_representation(instance)
-        rep['car'] = rep.pop('car_data')
-        rep['fourgon'] = rep.pop('fourgon_data')
-        rep['client'] = rep.pop('client_data')
-        rep['driver'] = rep.pop('driver_data')
-        rep['client_completed'] = rep.pop('client_completed_data')
+        # Safely swap IDs with objects for the frontend
+        if 'car_data' in rep:
+            rep['car'] = rep.pop('car_data')
+        if 'fourgon_data' in rep:
+            rep['fourgon'] = rep.pop('fourgon_data')
+        if 'client_data' in rep:
+            rep['client'] = rep.pop('client_data')
+        if 'driver_data' in rep:
+            rep['driver'] = rep.pop('driver_data')
+        if 'client_completed_data' in rep:
+            rep['client_completed'] = rep.pop('client_completed_data')
         return rep
+
     def create(self, validated_data):
         clients = validated_data.pop('client', [])
         clients_completed = validated_data.pop('client_completed', [])

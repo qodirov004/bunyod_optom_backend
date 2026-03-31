@@ -39,3 +39,13 @@ class IsDriverOrAdmin(permissions.BasePermission):
             request.user.is_authenticated and 
             request.user.status in ['driver', 'zaphos', 'cashier', 'bugalter', 'ceo', 'owner']
         )
+class IsBugalterOrAdmin(permissions.BasePermission):
+    """
+    Ruxsat: Bugalter, CEO yoki Owner
+    """
+    def has_permission(self, request, view):
+        return bool(
+            request.user and 
+            request.user.is_authenticated and 
+            request.user.status in ['bugalter', 'ceo', 'owner']
+        )

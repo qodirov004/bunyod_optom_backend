@@ -24,7 +24,7 @@ from rest_framework.permissions import AllowAny
 from rest_framework import permissions
 from rest_framework.filters import SearchFilter
 from rest_framework_simplejwt.tokens import RefreshToken
-from .permissions import IsOwnerOrCEO, IsCashierOrAdmin, IsZaphosOrAdmin, IsDriverOrAdmin
+from .permissions import IsOwnerOrCEO, IsCashierOrAdmin, IsZaphosOrAdmin, IsDriverOrAdmin, IsBugalterOrAdmin
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from .docs import load_doc as docs
@@ -57,8 +57,10 @@ def to_usd(amount, currency_obj) -> Decimal:
     try:
         usd_currency = models.CurrencyRate.objects.get(currency='USD')
         usd_rate = Decimal(str(usd_currency.rate_to_uzs))
+        if usd_rate == 0:
+            return Decimal('0.00')
         return amount_in_uzs / usd_rate
-    except (models.CurrencyRate.DoesNotExist, InvalidOperation, ZeroDivisionError):
+    except (models.CurrencyRate.DoesNotExist, ZeroDivisionError, InvalidOperation):
         return Decimal('0.00')
 
 
@@ -559,7 +561,7 @@ class FromLocationViewSet(viewsets.ModelViewSet):
         if self.action in ['list', 'retrieve']:
             permission_classes = [permissions.IsAuthenticated]
         else:
-            permission_classes = [IsOwnerOrCEO]
+            permission_classes = [IsBugalterOrAdmin]
         return [permission() for permission in permission_classes]
 
     queryset = models.FromLocation.objects.all()
@@ -571,7 +573,7 @@ class ToLocationViewSet(viewsets.ModelViewSet):
         if self.action in ['list', 'retrieve']:
             permission_classes = [permissions.IsAuthenticated]
         else:
-            permission_classes = [IsOwnerOrCEO]
+            permission_classes = [IsBugalterOrAdmin]
         return [permission() for permission in permission_classes]
 
     queryset = models.ToLocation.objects.all()
@@ -579,6 +581,7 @@ class ToLocationViewSet(viewsets.ModelViewSet):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
 class CarActiveDetailViewSet(ViewSet):
+    permission_classes = [IsBugalterOrAdmin]
     @swagger_auto_schema(
         operation_summary="🔍 Получить активную информацию по машине",
         operation_description="""
@@ -618,7 +621,7 @@ class CarActiveDetailViewSet(ViewSet):
             total_balonfurgon_usd + total_service_usd
         )
         response_data = {
-            "driver": CustomUserSerializer(driver).data,
+            "driver": rest_api.CustomUserSerializer(driver).data,
             "rays_id": rays.id,
             "start_time": start_time,
             "chiqimliklar": rest_api.ChiqimlikSerializer(chiqimliklar, many=True).data,
@@ -696,7 +699,7 @@ class CarActiveDetailViewSet(ViewSet):
             result.append({
                 "car_id": car.id,
                 "car_name": car.name,
-                "driver": CustomUserSerializer(driver).data,
+                "driver": rest_api.CustomUserSerializer(driver).data,
                 "rays_id": rays.id,
                 "start_time": start_time,
                 "chiqimliklar": rest_api.ChiqimlikSerializer(c_list, many=True).data,
@@ -1608,8 +1611,26 @@ class TexViewSet(viewsets.ModelViewSet):
     )
     def destroy(self, request, *args, **kwargs):
         return super().destroy(request, *args, **kwargs)
+
+class HistoryViewSet(viewsets.ModelViewSet):
+    queryset = models.RaysHistoryMod.objects.all()
+    serializer_class = rest_api.ExtendedRaysHistorySerializer
+    permission_classes = [IsBugalterOrAdmin]
+
+class CarFullHistoryViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsBugalterOrAdmin]
+    queryset = models.RaysHistoryMod.objects.select_related(
+        'driver', 'car', 'fourgon', 'country'
+    ).prefetch_related(
+        'client', 
+        'product_set',
+        'rayshistoryexpense_set'
+    ).all().order_by('-created_at')
+    serializer_class = rest_api.ExtendedRaysHistorySerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
     
 class RaysHistoryFullViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = [IsBugalterOrAdmin]
     queryset = models.RaysHistoryMod.objects.select_related(
         'driver', 'car', 'fourgon', 'country'
     ).prefetch_related(
@@ -1683,6 +1704,7 @@ class RaysHistoryFullViewSet(viewsets.ReadOnlyModelViewSet):
     def retrieve(self, request, *args, **kwargs):
         return super().retrieve(request, *args, **kwargs)
 class RaysViewSet(viewsets.ModelViewSet):
+    permission_classes = [IsBugalterOrAdmin]
     queryset = models.RaysMod.objects.select_related(
         'driver', 'car', 'fourgon', 'country', 'dp_currency'
     ).prefetch_related(

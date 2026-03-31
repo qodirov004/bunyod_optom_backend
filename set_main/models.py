@@ -276,8 +276,8 @@ class RaysMod(models.Model):
                     count=product.count,
                     client=client,
                     rays_history=history,
-                    from_location=product.from_location,
-                    to_location=product.to_location
+                    from_location=product.from_location.name if product.from_location else None,
+                    to_location=product.to_location.name if product.to_location else None
                 )
 
                 # 🟢 ДОБАВЛЯЕМ обновление ссылок:
@@ -343,11 +343,14 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
     photo = models.ImageField(upload_to='user_photos/', blank=True, null=True, default='defaults/furgon_default.avif')
 
     passport_series = models.CharField(max_length=4, blank=True, null=True)
-    passport_number = models.CharField(max_length=6, blank=True, null=True)
+    passport_number = models.CharField(max_length=10, blank=True, null=True)
     passport_issued_by = models.CharField(max_length=255, blank=True, null=True)
     passport_issued_date = models.DateField(blank=True, null=True)
     passport_birth_date = models.DateField(blank=True, null=True)
-    passport_photo = models.ImageField(upload_to='passport_photos/', blank=True, null=True, default='defaults/furgon_default.avif')
+    passport_photo_front = models.ImageField(upload_to='passport_photos/', blank=True, null=True, default='defaults/furgon_default.avif')
+    passport_photo_back = models.ImageField(upload_to='passport_photos/', blank=True, null=True, default='defaults/furgon_default.avif')
+    license_number = models.CharField(max_length=9, blank=True, null=True)
+    license_expiry = models.DateField(blank=True, null=True)
     is_busy = models.BooleanField(default=False)
 
     date = models.DateTimeField(auto_now_add=True)
