@@ -26,7 +26,7 @@ class IsZaphosOrAdmin(permissions.BasePermission):
         return bool(
             request.user and 
             request.user.is_authenticated and 
-            request.user.status in ['zaphos', 'ceo', 'owner']
+            request.user.status in ['zaphos', 'bugalter', 'ceo', 'owner']
         )
 
 class IsDriverOrAdmin(permissions.BasePermission):

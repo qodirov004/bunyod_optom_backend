@@ -74,3 +74,20 @@ class FromLocationAdmin(ModelAdmin):
 class ToLocationAdmin(ModelAdmin):
     list_display = ('name',)
     search_fields = ('name',)
+
+@admin.register(models.CashCategory)
+class CashCategoryAdmin(ModelAdmin):
+    list_display = ('name',)
+    search_fields = ('name',)
+
+@admin.register(models.CashTransactionMod)
+class CashTransactionModAdmin(ModelAdmin):
+    list_display = ('client', 'rays', 'amount', 'status', 'payment_way', 'created_at')
+    list_filter = ('status', 'payment_way', 'created_at')
+    search_fields = ('client__first_name', 'client__last_name', 'comment')
+
+@admin.register(models.CashTransactionHistory)
+class CashTransactionHistoryAdmin(ModelAdmin):
+    list_display = ('client', 'rays', 'amount', 'status', 'payment_way', 'created_at', 'moved_at')
+    list_filter = ('status', 'payment_way', 'created_at', 'moved_at')
+    search_fields = ('client__first_name', 'client__last_name', 'comment')

@@ -249,8 +249,9 @@ class RaysMod(models.Model):
         remaining_clients = self.client.exclude(id__in=self.client_completed.values_list('id', flat=True))
 
         for client in remaining_clients:
-            if not client_fully_paid_or_in_debt(client, self):
-                raise ValidationError(f"Клиент {client.first_name} не оплатил или не оформил долг.")
+            # We no longer block completion for unpaid clients to allow smoother workflow.
+            # Unpaid amounts can be tracked via history transactions or manual entry.
+            pass
 
         history = RaysHistoryMod.objects.create(
             rays_id=self.id,
