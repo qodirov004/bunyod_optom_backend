@@ -201,32 +201,37 @@ class RaysMod(models.Model):
             Product, ChiqimlikMod, BalonMod, BalonFurgon, Texnics,
             OptolMod, CurrencyRate
         )
-        from .views import to_usd
+
+        # Валюты
+        rates = {r.currency: float(r.rate_to_uzs) for r in CurrencyRate.objects.all()}
+        usd_rate = rates.get('USD', 1) or 1
+
+        def local_to_usd(amount, currency_obj_or_code):
+            if not currency_obj_or_code:
+                return 0
+            
+            # Extract currency code if it's an object
+            curr = getattr(currency_obj_or_code, 'currency', currency_obj_or_code)
+            
+            if curr == 'USD':
+                return float(amount)
+            elif curr == 'UZS':
+                return float(amount) / usd_rate
+            elif curr in rates:
+                return (float(amount) * rates[curr]) / usd_rate
+            return 0
 
         # Продукты
         total_usd_products = 0
         for client in self.client.all():
             products = Product.objects.filter(client=client, rays=self, is_delivered=False)
             for product in products:
-                total_usd_products += to_usd(product.price, product.currency)
+                total_usd_products += local_to_usd(product.price, product.currency)
         self.price = round(total_usd_products)
 
         # Все типы расходов
         start_time = self.created_at
         total_usd_expenses = 0
-
-        # Валюты
-        rates = {r.currency: float(r.rate_to_uzs) for r in CurrencyRate.objects.all()}
-        usd_rate = rates.get('USD', 1) or 1
-
-        def local_to_usd(amount, currency):
-            if currency == 'USD':
-                return float(amount)
-            elif currency == 'UZS':
-                return float(amount) / usd_rate
-            elif currency in rates:
-                return (float(amount) * rates[currency]) / usd_rate
-            return 0
 
         def sum_expenses(queryset):
             return sum(local_to_usd(item.price, getattr(item, 'currency', 'USD')) for item in queryset)
