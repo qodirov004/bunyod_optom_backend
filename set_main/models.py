@@ -98,6 +98,7 @@ class RaysHistoryMod(models.Model):
     price = models.BigIntegerField(default=0)
     dr_price = models.BigIntegerField(default=0)
     dp_price = models.BigIntegerField(default=0)
+    driver_expense = models.BigIntegerField(default=0)
     dp_currency = models.ForeignKey(CurrencyRate, on_delete=models.SET_NULL, null=True,default=get_default_currency)
     dp_information = models.TextField(blank=True, null=True)
     country = models.ForeignKey('CountryMod', on_delete=models.SET_NULL, null=True, blank=True)
@@ -121,6 +122,7 @@ class RaysHistoryMod(models.Model):
             price=self.price,
             dr_price=self.dr_price,
             dp_price=self.dp_price,
+            driver_expense=self.driver_expense,
             kilometer=self.kilometer,
             dp_information=self.dp_information,
             count=self.count,
@@ -184,6 +186,7 @@ class RaysMod(models.Model):
     price = models.BigIntegerField(default=0)
     dr_price = models.BigIntegerField(default=0)
     dp_price = models.BigIntegerField(default=0)
+    driver_expense = models.BigIntegerField(default=0)
     dp_currency = models.ForeignKey('CurrencyRate', on_delete=models.SET_NULL, null=True, blank=True,default=get_default_currency)
     dp_information = models.TextField(blank=True, null=True)
     country = models.ForeignKey('CountryMod', on_delete=models.SET_NULL, null=True, blank=True)
@@ -262,6 +265,7 @@ class RaysMod(models.Model):
             price=self.price,
             dr_price=self.dr_price,
             dp_price=self.dp_price,
+            driver_expense=self.driver_expense,
             dp_information=self.dp_information,
             kilometer=self.kilometer,
             count=self.count

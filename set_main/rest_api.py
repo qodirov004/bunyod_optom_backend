@@ -590,7 +590,7 @@ class ExtendedRaysHistorySerializer(serializers.ModelSerializer):
         model = models.RaysHistoryMod
         fields = [
             'id', 'rays_id', 'country', 'driver', 'car', 'fourgon', 'client',
-            'price', 'dr_price', 'dp_price', 'dp_currency',
+            'price', 'dr_price', 'dp_price', 'driver_expense', 'dp_currency',
             'kilometer', 'dp_information', 'created_at', 'count',
             'expenses'
         ]
@@ -633,7 +633,7 @@ class RaysSerializer(serializers.ModelSerializer):
         model = models.RaysMod
         fields = [
             'id', 'country', 'driver', 'car', 'fourgon', 'client', 'client_completed',
-            'price', 'dr_price', 'dp_price', 'dp_currency',
+            'price', 'dr_price', 'dp_price', 'driver_expense', 'dp_currency',
             'kilometer', 'dp_information', 'created_at', 'count', 'is_completed',
             'car_data', 'fourgon_data', 'client_data', 'driver_data', 'client_completed_data', 
             'expenses', 'country_name', 'dp_currency_name'
@@ -767,6 +767,8 @@ class RaysSerializer(serializers.ModelSerializer):
         instance = models.RaysMod(**validated_data)
         instance.price = 0  # будет пересчитано позже
         instance.dr_price = 0
+        if 'driver_expense' not in validated_data:
+            instance.driver_expense = 0
         instance.save()
 
         # Устанавливаем ManyToMany отношения
