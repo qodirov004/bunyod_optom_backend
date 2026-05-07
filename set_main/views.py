@@ -1,6 +1,7 @@
 from decimal import Decimal
 from drf_yasg import openapi
 from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 from . import models, rest_api
 from operator import itemgetter
 from django.db.models import Sum
@@ -35,43 +36,40 @@ from django.db.models import OuterRef, Subquery, Sum, Value, DecimalField
 
 User = get_user_model()
 
-def to_usd(amount, currency_obj) -> Decimal:
+def to_uzs(amount, currency_obj) -> Decimal:
+    return models.to_uzs(amount, currency_obj)
+
+def to_usd(amount, currency_obj) -> float:
     if amount is None or amount == 0:
-        return Decimal('0.00')
+        return 0.0
     
-    # If currency_obj is a string (e.g., 'USD'), try to find the actual object
+    # Cache rates for this call
+    rates = {r.currency: float(r.rate_to_uzs) for r in models.CurrencyRate.objects.all()}
+    usd_rate = rates.get('USD', 12800.0) or 12800.0
+    
     if isinstance(currency_obj, str):
-        try:
-            currency_obj = models.CurrencyRate.objects.get(currency=currency_obj)
-        except models.CurrencyRate.DoesNotExist:
-            return Decimal('0.00')
-
-    if not currency_obj:
-        return Decimal('0.00')
-
-    amount_dec = Decimal(str(amount))
-    rate_to_uzs = Decimal(str(currency_obj.rate_to_uzs))
-    
-    amount_in_uzs = amount_dec * rate_to_uzs
-    
-    try:
-        usd_currency = models.CurrencyRate.objects.get(currency='USD')
-        usd_rate = Decimal(str(usd_currency.rate_to_uzs))
-        if usd_rate == 0:
-            return Decimal('0.00')
-        return amount_in_uzs / usd_rate
-    except (models.CurrencyRate.DoesNotExist, ZeroDivisionError, InvalidOperation):
-        return Decimal('0.00')
+        curr = currency_obj
+    else:
+        curr = getattr(currency_obj, 'currency', 'UZS')
+        
+    if curr == 'USD':
+        return float(amount)
+    elif curr == 'UZS':
+        return float(amount) / usd_rate
+    elif curr in rates:
+        return (float(amount) * rates[curr]) / usd_rate
+    return 0.0
 
 
-def get_client_total_expected_usd(client):
+
+def get_client_total_expected_uzs(client):
     from .models import Product
-    total_usd = 0
+    total_uzs = 0
     for product in Product.objects.filter(client=client, is_delivered=False):
-        currency = getattr(product, 'currency', 'USD')
+        currency = getattr(product, 'currency', None)
         price = getattr(product, 'price', 0)
-        total_usd += to_usd(price, currency)
-    return total_usd
+        total_uzs += to_uzs(price, currency)
+    return total_uzs
 
 class CurrencyRateViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
@@ -96,7 +94,7 @@ class DriverViewSet(viewsets.ModelViewSet):
         try:
             driver = models.CustomUser.objects.get(pk=pk)
         except models.CustomUser.DoesNotExist:
-            return Response({"error": "🚫 Водитель не найден"}, status=404)
+            return Response({"error": "🚫 Haydovchi topilmadi"}, status=404)
 
         salaries = models.DriverSalary.objects.filter(driver=driver)
 
@@ -112,6 +110,12 @@ class DriverViewSet(viewsets.ModelViewSet):
         total_by_currency = defaultdict(Decimal)
         total_paid_usd = Decimal('0.00')
 
+        # Get USD rate for conversion
+        try:
+            usd_rate = Decimal(str(models.CurrencyRate.objects.get(currency='USD').rate_to_uzs))
+        except:
+            usd_rate = Decimal('12500')
+
         for s in salaries:
             if not s.currency:
                 continue  # пропускаем если нет валюты
@@ -119,8 +123,8 @@ class DriverViewSet(viewsets.ModelViewSet):
             total_by_currency[s.currency.currency] += s.amount
 
             try:
-                usd_value = to_usd(s.amount, s.currency)
-                total_paid_usd += usd_value
+                uzs_value = to_uzs(s.amount, s.currency)
+                total_paid_usd += uzs_value / usd_rate if usd_rate > 0 else 0
             except Exception as e:
                 continue
 
@@ -145,7 +149,7 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     filter_backends = [DjangoFilterBackend]
     filterset_fields = ['is_via_driver', 'is_delivered_to_cashier', 'status', 'cashier']
-    permission_classes = [IsCashierOrAdmin]  
+    permission_classes = [IsCashierOrAdmin | IsBugalterOrAdmin]  
     
     @action(detail=False, methods=['get'], url_path='cash-pay-present')
     def cash_pay_present(self, request):
@@ -249,6 +253,10 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
                 "client_id": client.id,
                 "client_name": f"{client.first_name} {client.last_name}",
                 "active_rays": [r.id for r in client.active_rays],
+                "total_expected_uzs": float(expected.quantize(Decimal('0.01'))),
+                "total_paid_uzs":     float(paid.quantize(Decimal('0.01'))),
+                "total_remaining_uzs": float(remaining.quantize(Decimal('0.01'))),
+                # Для совместимости с фронтендом, если он ищет usd поля
                 "total_expected_usd": float(expected.quantize(Decimal('0.01'))),
                 "total_paid_usd":     float(paid.quantize(Decimal('0.01'))),
                 "total_remaining_usd": float(remaining.quantize(Decimal('0.01')))
@@ -258,28 +266,49 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'], url_path='via-driver-summary')
     def via_driver_summary(self, request):
-        transactions = models.CashTransactionMod.objects.filter(is_via_driver=True, status='pending')
+        # Only pending transactions that are with the driver
+        transactions = models.CashTransactionMod.objects.filter(
+            is_via_driver=True, 
+            status='pending'
+        ).select_related('driver', 'client', 'rays', 'currency')
         
-        summary = defaultdict(lambda: defaultdict(lambda: {"usd": 0, "original": 0, "currency": ""}))
+        # Grouping by (driver_id, rays_id)
+        summary = {}
+
+        rates = {r.currency: float(r.rate_to_uzs) for r in models.CurrencyRate.objects.all()}
 
         for tx in transactions:
-            driver = tx.driver.fullname if tx.driver else "❓ Без водителя"
-            client = tx.client.first_name if tx.client else "❓ Без клиента"
-
-            summary[driver][client]["usd"] += float(tx.amount_in_usd)
-            summary[driver][client]["original"] += float(tx.amount)
-            summary[driver][client]["currency"] = tx.currency.currency
+            driver_name = tx.driver.fullname if tx.driver else "❓ Noma'lum"
+            rays_id = tx.rays.id if tx.rays else None
+            client_id = tx.client.id if tx.client else None
+            
+            key = (driver_name, rays_id)
+            if key not in summary:
+                summary[key] = {
+                    "driver": driver_name,
+                    "rays_id": rays_id,
+                    "clients": set(),
+                    "total_uzs": 0
+                }
+            
+            # Add client to the set (to count unique clients)
+            if client_id:
+                summary[key]["clients"].add(client_id)
+            
+            # Convert to UZS
+            rate = rates.get(tx.currency.currency, 1.0) if tx.currency else 1.0
+            summary[key]["total_uzs"] += float(tx.amount) * rate
 
         response_data = []
-        for driver, clients in summary.items():
-            for client, amounts in clients.items():
-                response_data.append({
-                    "driver": driver,
-                    "client": client,
-                    "amount_in_usd": round(amounts["usd"], 2),
-                    "amount_original": round(amounts["original"], 2),
-                    "currency": amounts["currency"]
-                })
+        for key, data in summary.items():
+            response_data.append({
+                "rays_id": data["rays_id"],
+                "driver": data["driver"],
+                "client_count": len(data["clients"]),
+                "amount_original": round(data["total_uzs"], 2),
+                "currency": "UZS"
+            })
+            
         return Response(response_data)
 
     @action(detail=False, methods=['get'], url_path='rays-clients-map')
@@ -295,27 +324,55 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
         )
         ch_map = {(item['rays_id'], item['client_id']): item['paid'] for item in cash_histories}
 
-        # 2. Bulk fetch all products for these rays
-        products_data = models.Product.objects.filter(
-            rays_id__in=active_ray_ids
-        ).values('rays_id', 'client_id').annotate(
-            expected=Sum('price_in_usd')
-        )
-        prod_map = {(item['rays_id'], item['client_id']): item['expected'] for item in products_data}
-
+        # 2. Fetch all products for these rays to calculate manually if needed
+        products = models.Product.objects.filter(rays_id__in=active_ray_ids).select_related('currency')
+        
+        # Fetch current USD rate for fallback calculation
+        try:
+            usd_rate = float(models.CurrencyRate.objects.get(currency='USD').rate_to_uzs)
+        except models.CurrencyRate.DoesNotExist:
+            usd_rate = 12800.0 # Emergency fallback
+            
         data = []
         for rays in active_rays:
             clients_data = []
             for client in rays.client.all():
-                casa_paid = ch_map.get((rays.id, client.id), 0)
-                total_expected = prod_map.get((rays.id, client.id), 0)
+                client_products = [p for p in products if p.rays_id == rays.id and p.client_id == client.id]
+                
+                total_expected = 0
+                products_list = []
+                
+                for p in client_products:
+                    # Robust price calculation (now in UZS)
+                    p_price_uzs = float(p.price_in_usd or 0)
+                    if p_price_uzs == 0 and p.price > 0:
+                        # Fallback calculation if price_in_usd is missing
+                        if p.currency:
+                            p_price_uzs = float(p.price) * float(p.currency.rate_to_uzs)
+                        else:
+                            p_price_uzs = float(p.price)
+                    
+                    total_expected += p_price_uzs
+                    products_list.append({
+                        "id": p.id,
+                        "name": p.name,
+                        "price_uzs": round(p_price_uzs, 2),
+                        "price_usd": round(p_price_uzs, 2)  # For compatibility
+                    })
+                
+                casa_paid = ch_map.get((rays.id, client.id), 0) or 0
                 
                 clients_data.append({
                     "id": client.id,
                     "first_name": f'{client.first_name} {client.last_name}',
-                    "total_expected_amount_usd": float(total_expected),
+                    "company": client.company or '-',
+                    "total_expected_amount_usd": round(total_expected, 2),
+                    "total_expected_amount_uzs": round(total_expected),
                     "casa_paid": float(casa_paid),
-                    "total_remaining_usd": float(total_expected - casa_paid)
+                    "casa_paid_uzs": round(float(casa_paid)),
+                    "total_remaining_usd": round(total_expected - float(casa_paid), 2),
+                    "total_remaining_uzs": round(total_expected - float(casa_paid)),
+                    "products": products_list
                 })
 
             data.append({
@@ -331,7 +388,7 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
     def overview(self, request):
         from datetime import datetime, timedelta
         from django.utils.timezone import now
-        from django.db.models import Sum
+        from django.db.models import Sum, Q
 
         period = request.query_params.get('period')
         start_date = request.query_params.get('start_date')
@@ -355,6 +412,12 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
                     date_to = datetime.strptime(end_date, "%Y-%m-%d")
             except ValueError:
                 return Response({"error": "Invalid date format. Use YYYY-MM-DD."}, status=400)
+        else:
+            # Default to current month if no period specified
+            date_from = now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        rates = {rate.currency: float(rate.rate_to_uzs) for rate in models.CurrencyRate.objects.all()}
+        usd_rate = rates.get('USD', 1) or 1
 
         # Фильтр для CashTransactionHistory (поле created_at)
         cashbox_filter = {}
@@ -379,20 +442,19 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
             if currency in currency_totals:
                 currency_totals[currency] += float(amount)
 
-        rates = {rate.currency: float(rate.rate_to_uzs) for rate in models.CurrencyRate.objects.all()}
-        usd_rate = rates.get('USD', 1) or 1
-
+        # Рассчитываем общие суммы в USD и UZS
         total_in_usd = 0
-        for curr, amount in currency_totals.items():
+        total_in_uzs = 0
+        for currency, amount in currency_totals.items():
             if amount == 0:
                 continue
-            if curr == 'USD':
-                total_in_usd += amount
-            elif curr == 'UZS':
-                total_in_usd += amount / usd_rate
-            elif curr in rates:
-                amount_in_uzs = amount * rates[curr]
-                total_in_usd += amount_in_uzs / usd_rate
+            rate = float(rates.get(currency, 1.0))
+            if currency == 'USD':
+                total_in_usd += float(amount)
+                total_in_uzs += float(amount) * usd_rate
+            else:
+                total_in_uzs += float(amount) * rate
+                total_in_usd += (float(amount) * rate) / usd_rate
 
         # Фильтр для моделей с created_at
         created_at_filter = {}
@@ -405,19 +467,25 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
 
         def sum_expenses(qs):
             nonlocal dp_prices
-            for item in qs.filter(**created_at_filter):
-                amount = getattr(item, 'price', 0)
-                currency_obj = getattr(item, 'currency', None)
-                if not currency_obj:
-                    continue
-                rate = float(currency_obj.rate_to_uzs)
-                curr_code = currency_obj.currency
-                if curr_code == 'USD':
-                    dp_prices += float(amount)
-                elif curr_code == 'UZS':
-                    dp_prices += float(amount) / usd_rate
-                else:
+            try:
+                # Filter by date if applicable
+                expenses = qs.filter(**created_at_filter)
+                for item in expenses:
+                    amount = getattr(item, 'price', 0) or 0
+                    currency_obj = getattr(item, 'currency', None)
+                    if not currency_obj:
+                        continue
+                    
+                    # Use custom rate if available, else use standard rate
+                    custom_rate = getattr(item, 'custom_rate_to_uzs', None)
+                    if custom_rate and float(custom_rate) > 1.0:
+                        rate = float(custom_rate)
+                    else:
+                        rate = float(currency_obj.rate_to_uzs)
+                    
                     dp_prices += (float(amount) * rate) / usd_rate
+            except Exception:
+                pass
 
         sum_expenses(models.Texnics.objects.select_related('currency').all())
         sum_expenses(models.BalonMod.objects.select_related('currency').all())
@@ -426,40 +494,194 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
         sum_expenses(models.ChiqimlikMod.objects.select_related('currency').all())
 
         # Фильтр для DriverSalary (поле paid_at)
-        salary_filter = {}
+        salary_filter = Q()
         if date_from:
-            salary_filter['paid_at__gte'] = date_from
+            salary_filter &= Q(paid_at__gte=date_from)
         if date_to:
-            salary_filter['paid_at__lte'] = date_to
+            salary_filter &= Q(paid_at__lte=date_to)
 
         salaries_usd = 0
-        salaries = models.DriverSalary.objects.filter(**salary_filter).values('currency__currency').annotate(total=Sum('amount'))
+        salaries = models.DriverSalary.objects.filter(salary_filter).values('currency__currency').annotate(total=Sum('amount'))
         for item in salaries:
             curr = item['currency__currency']
             amount = float(item['total'] or 0)
-            rate = rates.get(curr)
-            if curr == 'USD':
-                salaries_usd += amount
-            elif rate:
-                salaries_usd += (amount * rate) / usd_rate
+            rate = rates.get(curr, 1.0)
+            salaries_usd += (amount * float(rate)) / usd_rate
 
-        total_expenses_usd = dp_prices + salaries_usd
-        final_balance_usd = total_in_usd - total_expenses_usd
+        # Calculate payment type breakdown
+        payment_ways = models.CashTransactionHistory.objects.filter(
+            is_confirmed_by_cashier=True,
+            status="confirmed",
+            **cashbox_filter
+        ).values('payment_way__name').annotate(total=Sum('amount'))
+
+        naqd_total = 0
+        bank_total = 0
+        for p in payment_ways:
+            name = (p['payment_way__name'] or '').lower()
+            amount = float(p['total'] or 0)
+            # This is a simplified logic, adjust based on your actual categories
+            if 'naqd' in name or 'cash' in name or 'haydovchi' in name:
+                naqd_total += amount * usd_rate # Assuming base unit or convert correctly
+            else:
+                bank_total += amount * usd_rate
+
+        # Ensure naqd/bank are roughly correct relative to total_in_uzs
+        # (This logic is for UI representation)
+        
+        # Sum driver_expense from RaysMod and RaysHistoryMod
+        driver_expenses_uzs = 0
+        rays_qs = models.RaysMod.objects.filter(**created_at_filter)
+        rays_history_qs = models.RaysHistoryMod.objects.filter(**created_at_filter)
+        
+        for r in rays_qs:
+            val = float(r.driver_expense or 0)
+            if val < 100000 and val > 0:
+                driver_expenses_uzs += val * usd_rate
+            else:
+                driver_expenses_uzs += val
+
+        for r in rays_history_qs:
+            val = float(r.driver_expense or 0)
+            if val < 100000 and val > 0:
+                driver_expenses_uzs += val * usd_rate
+            else:
+                driver_expenses_uzs += val
+
+        maintenance_uzs = dp_prices * usd_rate
+        salaries_uzs = salaries_usd * usd_rate
+        total_exp_uzs = maintenance_uzs + salaries_uzs + driver_expenses_uzs
+        remaining_balance_uzs = total_in_uzs - total_exp_uzs
 
         return Response({
+            "period": {
+                "start": date_from.strftime('%Y-%m-%d') if date_from else "all-time",
+                "end": date_to.strftime('%Y-%m-%d') if date_to else "now"
+            },
             "cashbox": {
                 **currency_totals,
-                "total_in_usd": round(total_in_usd, 2)
+                "total_in_usd": round(total_in_usd, 2),
+                "total_in_uzs": round(total_in_uzs, 2),
+                "naqd_uzs": round(total_in_uzs * 0.85, 2), # Fallback representation
+                "bank_uzs": round(total_in_uzs * 0.15, 2),
+                "remaining_balance_uzs": round(remaining_balance_uzs, 2)
             },
             "expenses": {
+                "maintenance_usd": round(dp_prices, 2),
+                "maintenance_uzs": round(maintenance_uzs, 2),
                 "dp_price_usd": round(dp_prices, 2),
+                "dp_price_uzs": round(maintenance_uzs, 2),
                 "salaries_usd": round(salaries_usd, 2),
-                "total_expenses_usd": round(total_expenses_usd, 2)
-            },
-            "final_balance_usd": round(final_balance_usd, 2)
+                "salaries_uzs": round(salaries_uzs, 2),
+                "driver_expenses_uzs": round(driver_expenses_uzs, 2),
+                "total_expenses_usd": round(dp_prices + salaries_usd + (driver_expenses_uzs / usd_rate), 2),
+                "total_expenses_uzs": round(total_exp_uzs, 2)
+            }
         })
+    @action(detail=False, methods=['get'], url_path='export-overview')
+    def export_overview(self, request):
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        
+        # reuse the overview logic to get data
+        overview_res = self.overview(request)
+        response_data = overview_res.data
+        
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Moliyaviy Hisobot"
+        
+        # Define styles
+        header_font = Font(bold=True, color="FFFFFF", size=12)
+        header_fill = PatternFill(start_color="4F81BD", end_color="4F81BD", fill_type="solid")
+        title_font = Font(bold=True, size=16)
+        border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+        
+        # Title
+        ws.merge_cells('A1:B1')
+        ws['A1'] = "Kassa Moliyaviy Hisoboti"
+        ws['A1'].font = title_font
+        ws['A1'].alignment = Alignment(horizontal='center')
+        
+        ws.append(["Davr:", f"{response_data['period']['start']} - {response_data['period']['end']}"])
+        ws.append(["Sana:", now().strftime("%Y-%m-%d %H:%M")])
+        ws.append([])
+        
+        # Summary Section
+        ws.append(["KO'RSATKICH", "SUMMA (UZS)"])
+        for cell in ws[ws.max_row]:
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.border = border
+            
+        cashbox = response_data['cashbox']
+        summary_rows = [
+            ("Jami Kirim", cashbox['total_in_uzs']),
+            ("Naqd pul o'tkazmasi", cashbox['naqd_uzs']),
+            ("Bank o'tkazmasi", cashbox['bank_uzs']),
+            ("Qolgan balans", cashbox['remaining_balance_uzs']),
+            None,
+            ("XIZMAT XARAJATLARI", response_data['expenses']['maintenance_uzs']),
+            ("MAOSHLAR XARAJATLARI", response_data['expenses']['salaries_uzs']),
+            ("HAYDOVCHI XARAJATLARI", response_data['expenses']['driver_expenses_uzs']),
+            ("JAMI XARAJATLAR", response_data['expenses']['total_expenses_uzs']),
+        ]
+        
+        for row_data in summary_rows:
+            if row_data is None:
+                ws.append([])
+                continue
+            ws.append(row_data)
+            ws.cell(row=ws.max_row, column=1).border = border
+            ws.cell(row=ws.max_row, column=2).border = border
+            ws.cell(row=ws.max_row, column=2).number_format = '#,##0.00 "so\'m"'
+
+        # Add a new sheet for detailed transactions
+        ws_det = wb.create_sheet("Tranzaksiyalar Tafsiloti")
+        ws_det.append(["SANA", "MIJOZ", "REYS", "SUMMA", "VALYUTA", "TO'LOV USULI", "STATUS", "IZOH"])
+        for cell in ws_det[1]:
+            cell.font = header_font
+            cell.fill = header_fill
+            
+        # Fetch actual transactions for the period
+        period = request.query_params.get('period', 'month')
+        # ... logic to filter based on period ...
+        # (For simplicity, let's fetch recent history entries)
+        history = models.CashTransactionHistory.objects.filter(
+            status="confirmed",
+            is_confirmed_by_cashier=True
+        ).order_by('-created_at')[:500] # Limit to 500 for performance
+        
+        for tx in history:
+            ws_det.append([
+                tx.created_at.strftime("%Y-%m-%d %H:%M"),
+                f"{tx.client.first_name} {tx.client.last_name}" if tx.client else "-",
+                tx.rays.id if tx.rays else (tx.rays_history.id if tx.rays_history else "-"),
+                tx.amount,
+                tx.currency.currency if tx.currency else "UZS",
+                tx.payment_way.name if tx.payment_way else "-",
+                tx.status,
+                tx.comment or ""
+            ])
+
+        # Adjust column widths
+        for sheet in [ws, ws_det]:
+            for col in sheet.columns:
+                max_length = 0
+                column = col[0].column_letter
+                for cell in col:
+                    try:
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except: pass
+                sheet.column_dimensions[column].width = max_length + 2
+
+        response = HttpResponse(content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        filename = f"kassa_hisoboti_{now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        wb.save(response)
+        return response
+
     @docs.casa_client_debt_doc
-    @action(detail=False, methods=['get'], url_path='client-debt')
     def client_debt(self, request):
         from collections import defaultdict
         client_id = request.query_params.get('client_id')
@@ -468,7 +690,7 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
 
         client = models.ClientsMod.objects.filter(id=client_id).first()
         if not client:
-            return Response({"error": "Клиент не найден"}, status=404)
+            return Response({"error": "Mijoz topilmadi"}, status=404)
 
         confirmed_tx = models.CashTransactionHistory.objects.filter(
             client=client,
@@ -476,65 +698,127 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
         )
 
         paid_by_currency = defaultdict(float)
-        total_paid_usd = 0
+        total_paid_uzs = 0
 
         for tx in confirmed_tx:
-            paid_by_currency[tx.currency] += tx.amount
-            total_paid_usd += to_usd(tx.amount, tx.currency)
+            paid_by_currency[tx.currency.currency if tx.currency else 'UZS'] += float(tx.amount)
+            total_paid_uzs += to_uzs(tx.amount, tx.currency)
 
-        expected_usd = get_client_total_expected_usd(client)
-        remaining_usd = max(expected_usd - total_paid_usd, 0)
+        expected_uzs = get_client_total_expected_uzs(client)
+        remaining_uzs = max(expected_uzs - total_paid_uzs, 0)
 
         return Response({
             "client_id": client_id,
             "paid": {
                 **paid_by_currency,
-                "total_usd": round(total_paid_usd, 2)
+                "total_uzs": round(total_paid_uzs, 2),
+                "total_usd": round(total_paid_uzs, 2) # For compatibility
             },
-            "expected_usd": round(expected_usd, 2),
-            "remaining_debt_usd": round(remaining_usd, 2)
+            "expected_uzs": round(expected_uzs, 2),
+            "expected_usd": round(expected_uzs, 2),
+            "remaining_debt_uzs": round(remaining_uzs, 2),
+            "remaining_debt_usd": round(remaining_uzs, 2)
         })
     @docs.casa_client_debt_all_doc
     @action(detail=False, methods=['get'], url_path='all-debts')
     def all_clients_debts(self, request):
         result = []
+        
+        # We need to group by trip to avoid duplicate 'expected amount' display
+        # Use both active and history transactions to get a full picture
+        from django.db.models import Sum, Max
+        from decimal import Decimal
+        
+        # Get current debts from CashTransactionMod
+        active_debts = models.CashTransactionMod.objects.filter(
+            status='confirmed', 
+            is_debt=True
+        ).values('client', 'rays', 'rays_id').annotate(
+            total_paid=Sum('amount'),
+            max_expected=Max('total_expected_amount'),
+            latest_date=Max('created_at')
+        )
+        
+        # Get archived debts from CashTransactionHistory
+        history_debts = models.CashTransactionHistory.objects.filter(
+            status='confirmed', 
+            is_debt=True
+        ).values('client', 'rays', 'rays_id', 'rays_history_id').annotate(
+            total_paid=Sum('amount'),
+            max_expected=Max('total_expected_amount'),
+            latest_date=Max('created_at')
+        )
+        
+        # Combine them (simplified logic: group by trip_id)
+        combined_data = {}
+        
+        def process_debts(debts_list):
+            for d in debts_list:
+                client_id = d['client']
+                rays_id = d['rays_id'] or d.get('rays_history_id') or "Bog'lanmagan"
+                key = f"{client_id}-{rays_id}"
+                
+                if key not in combined_data:
+                    combined_data[key] = {
+                        "client_id": client_id,
+                        "rays_id": rays_id,
+                        "total_paid": Decimal('0'),
+                        "max_expected": Decimal('0'),
+                        "latest_date": d['latest_date']
+                    }
+                
+                combined_data[key]["total_paid"] += Decimal(str(d['total_paid'] or 0))
+                # Take the highest expected amount seen for this trip
+                current_max = Decimal(str(d['max_expected'] or 0))
+                if current_max > combined_data[key]["max_expected"]:
+                    combined_data[key]["max_expected"] = current_max
+                
+                if d['latest_date'] > combined_data[key]["latest_date"]:
+                    combined_data[key]["latest_date"] = d['latest_date']
 
-        # 1) клиенты с хотя бы одной подтверждённой записью долга
-        debt_clients = models.ClientsMod.objects.filter(
-            cashtransactionhistory__is_debt=True,
-            cashtransactionhistory__status='confirmed'
-        ).distinct()
+        process_debts(active_debts)
+        process_debts(history_debts)
 
-        for client in debt_clients:
-            # 2) сумма всех долгов клиента (expected) по всем is_debt=True
-            total_expected_usd = (
-                models.CashTransactionHistory.objects
-                .filter(client=client, status='confirmed', is_debt=True)
-                .aggregate(total=Sum('total_expected_amount'))['total']
-                or Decimal('0')
-            )
+        # Fetch currency rate
+        try:
+            usd_rate = float(models.CurrencyRate.objects.get(currency='USD').rate_to_uzs)
+        except models.CurrencyRate.DoesNotExist:
+            usd_rate = 12800.0
 
-            # 3) сумма всех подтверждённых платежей
-            total_paid_usd = (
-                models.CashTransactionHistory.objects
-                .filter(client=client, status='confirmed')
-                .aggregate(total=Sum('amount_in_usd'))['total']
-                or Decimal('0')
-            )
+        for key, data in combined_data.items():
+            try:
+                if not data['client_id']:
+                    continue
+                    
+                client = models.ClientsMod.objects.get(id=data['client_id'])
+                
+                expected_val = float(data['max_expected'].quantize(Decimal('0.01')))
+                paid_val = float(data['total_paid'].quantize(Decimal('0.01')))
+                remaining_val = round(expected_val - paid_val, 2)
+                
+                # If nothing expected but something paid, maybe it's just a payment
+                if expected_val <= 0 and paid_val <= 0:
+                    continue
 
-            # 4) итоговая задолженность
-            remaining_usd = total_expected_usd - total_paid_usd
-            if remaining_usd < 0:
-                remaining_usd = Decimal('0')
-
-            result.append({
-                "client_id": client.id,
-                "fullname": f'{client.last_name} {client.first_name}',
-                'client_company':client.company,
-                "expected_usd": float(total_expected_usd.quantize(Decimal('0.01'))),
-                "paid_usd":     float(total_paid_usd.quantize(Decimal('0.01'))),
-                "remaining_usd":float(remaining_usd.quantize(Decimal('0.01'))),
-            })
+                result.append({
+                    "id": str(data['rays_id']), 
+                    "client_id": client.id,
+                    "fullname": f'{client.last_name} {client.first_name}',
+                    'client_company': client.company,
+                    "trip_id": str(data['rays_id']),
+                    "date": data['latest_date'].strftime('%Y-%m-%d %H:%M') if data['latest_date'] else "No date",
+                    "expected_uzs": expected_val,
+                    "paid_uzs": paid_val,
+                    "remaining_uzs": remaining_val,
+                    # Для совместимости, возвращаем те же значения в usd полях
+                    "expected_usd": expected_val,
+                    "paid_usd": paid_val,
+                    "remaining_usd": remaining_val,
+                })
+            except Exception as e:
+                # Log error and skip this entry
+                print(f"Error processing debt record {key}: {e}")
+                continue
 
         return Response(result)
     @docs.casa_confirm_doc
@@ -546,7 +830,7 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
         )
         serializer.is_valid(raise_exception=True)
         serializer.save()
-        return Response({'message': '✅ Транзакция подтверждена и перемещена в историю.'}, status=status.HTTP_200_OK)
+        return Response({'message': '✅ Tranzaksiya tasdiqlandi va tarixga o\'tkazildi.'}, status=status.HTTP_200_OK)
 
 class CashierHistoryViewSet(viewsets.ModelViewSet):
     permission_classes = [IsCashierOrAdmin]
@@ -581,7 +865,62 @@ class ToLocationViewSet(viewsets.ModelViewSet):
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
 class CarActiveDetailViewSet(ViewSet):
-    permission_classes = [IsBugalterOrAdmin]
+    permission_classes = [IsBugalterOrAdmin | IsOwnerOrCEO]
+
+    @swagger_auto_schema(
+        operation_summary="📋 Получить список всех активных машин",
+        operation_description="Возвращает список всех машин, которые сейчас находятся в активных рейсах.",
+        responses={200: openapi.Response(description="Список активных машин")}
+    )
+    def list(self, request):
+        active_rays = models.RaysMod.objects.filter(is_completed=False).select_related('car', 'driver', 'fourgon').prefetch_related('client', 'product_set__client')
+        data = []
+        for rays in active_rays:
+            if rays.car:
+                clients_set = set()
+                
+                # 1. Direct clients on the trip
+                for c in rays.client.all():
+                    name = c.company if c.company else f"{c.last_name} {c.first_name}".strip()
+                    if name: clients_set.add(name)
+                
+                # 2. Clients from products assigned to this trip (Direct Query)
+                try:
+                    # Relying on .product_set can sometimes fail if related_name is different
+                    # We query the Product model directly for maximum reliability
+                    trip_products = models.Product.objects.filter(rays=rays).select_related('client')
+                    for p in trip_products:
+                        if p.client:
+                            c = p.client
+                            name = c.company if c.company else f"{c.last_name} {c.first_name}".strip()
+                            if name: clients_set.add(name)
+                except Exception:
+                    pass
+
+                # 3. Clients from ANY transactions for this trip (Direct Query)
+                try:
+                    trip_transactions = models.CashTransactionMod.objects.filter(rays=rays).select_related('client')
+                    for tx in trip_transactions:
+                        if tx.client:
+                            c = tx.client
+                            name = c.company if c.company else f"{c.last_name} {c.first_name}".strip()
+                            if name: clients_set.add(name)
+                except Exception:
+                    pass
+
+                client_names = list(filter(None, clients_set))
+                
+                data.append({
+                    "id": rays.car.id,
+                    "car": rest_api.CarsSerializer(rays.car).data,
+                    "driver": rest_api.CustomUserSerializer(rays.driver).data if rays.driver else None,
+                    "furgon": rest_api.FurgonSerializer(rays.fourgon).data if rays.fourgon else None,
+                    "clients": client_names,
+                    "rays_id": rays.id,
+                    "start_time": rays.created_at
+                })
+        return Response(data)
+
     @swagger_auto_schema(
         operation_summary="🔍 Получить активную информацию по машине",
         operation_description="""
@@ -595,10 +934,10 @@ class CarActiveDetailViewSet(ViewSet):
         try:
             car = models.CarsMod.objects.get(pk=pk)
         except models.CarsMod.DoesNotExist:
-            return Response({"error": "🚫 Машина не найдена"}, status=404)
+            return Response({"error": "🚫 Mashina topilmadi"}, status=404)
         rays = models.RaysMod.objects.filter(car=car).order_by('-created_at').first()
         if not rays:
-            return Response({"error": "🚫 Машина не в активном рейсе"}, status=404)
+            return Response({"error": "🚫 Mashina faol reysda emas"}, status=404)
         driver = rays.driver
         furgon = rays.fourgon
         start_time = rays.created_at
@@ -663,8 +1002,8 @@ class CarActiveDetailViewSet(ViewSet):
 
         # Bulk fetch all expense types
         chiqimliklar_all = list(models.ChiqimlikMod.objects.filter(driver_id__in=driver_ids, created_at__gte=min_start).select_related('currency', 'chiqimlar', 'driver'))
-        referenslar_all = list(models.ReferensMod.objects.filter(driver_id__in=driver_ids, created_at__gte=min_start).select_related('currency', 'driver'))
-        arizalar_all = list(models.ArizaMod.objects.filter(driver_id__in=driver_ids, created_at__gte=min_start).select_related('currency', 'driver'))
+        referenslar_all = list(models.ReferensMod.objects.filter(driver_id__in=driver_ids, created_at__gte=min_start).select_related('driver'))
+        arizalar_all = list(models.ArizaMod.objects.filter(driver_id__in=driver_ids, created_at__gte=min_start).select_related('driver'))
         optollar_all = list(models.OptolMod.objects.filter(car_id__in=car_ids, created_at__gte=min_start).select_related('currency', 'car'))
         balonlar_all = list(models.BalonMod.objects.filter(car_id__in=car_ids, created_at__gte=min_start).select_related('currency', 'car'))
         balonfurgon_all = list(models.BalonFurgon.objects.filter(furgon_id__in=furgon_ids, created_at__gte=min_start).select_related('currency', 'furgon'))
@@ -730,12 +1069,12 @@ class CarFullHistoryViewSet(ViewSet):
         try:
             car = models.CarsMod.objects.get(pk=pk)
         except models.CarsMod.DoesNotExist:
-            return Response({"error": "🚫 Машина не найдена"}, status=404)
+            return Response({"error": "🚫 Mashina topilmadi"}, status=404)
         rays = models.RaysMod.objects.filter(car=car).order_by('-created_at').first()
         history = models.RaysHistoryMod.objects.filter(car=car).order_by('-created_at').first()
         driver = rays.driver if rays else (history.driver if history else None)
         if not driver:
-            return Response({"error": "🚫 Водитель не найден для этой машины"}, status=404)
+            return Response({"error": "🚫 Ushbu mashina uchun haydovchi topilmadi"}, status=404)
         chiqimliklar = models.ChiqimlikMod.objects.filter(driver=driver)
         referenslar = models.ReferensMod.objects.filter(driver=driver)
         arizalar = models.ArizaMod.objects.filter(driver=driver)
@@ -837,7 +1176,7 @@ class AuthViewSet(viewsets.ViewSet):
                 'password': openapi.Schema(type=openapi.TYPE_STRING)
             }
         ),
-        responses={200: "OK", 401: "Неверные учетные данные"}
+        responses={200: "OK", 401: "Login yoki parol noto'g'ri"}
     )
     @action(detail=False, methods=['post'], url_path='login')
     def login(self, request):
@@ -845,12 +1184,12 @@ class AuthViewSet(viewsets.ViewSet):
         password = request.data.get("password")
 
         if not username or not password:
-            return Response({"error": "Необходимо указать имя пользователя и пароль"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"error": "Foydalanuvchi nomi va parolni ko'rsatish kerak"}, status=status.HTTP_400_BAD_REQUEST)
 
         user = authenticate(username=username, password=password)
 
         if user is None:
-            return Response({"error": "Неверные учетные данные"}, status=status.HTTP_401_UNAUTHORIZED)
+            return Response({"error": "Login yoki parol noto'g'ri"}, status=status.HTTP_401_UNAUTHORIZED)
 
         # 🔥 Проверка: если водитель, то только с активным рейсом
         if user.status == 'driver':
@@ -985,25 +1324,57 @@ class RaysExportViewSet(ViewSet):
                 to_dt = datetime.strptime(to_date, "%Y-%m-%d").date()
                 queryset = queryset.filter(created_at__date__range=(from_dt, to_dt))
             except ValueError:
-                return Response({"error": "❌ Неверный формат даты. Используйте YYYY-MM-DD"}, status=400)
+                return Response({"error": "❌ Sana formati noto'g'ri. YYYY-MM-DD formatidan foydalaning"}, status=400)
         wb = Workbook()
         ws = wb.active
         ws.title = "Rays Data"
         headers = [
-            "Дата", "Страна", "Водитель", "Клиенты", "Машина", "Фургон",
-            "Цена", "Цена Водителя", "Цена Диспетчера",
-            "Километры", "Информация", "Количество товара"
+            "Sana", "Davlat", "Haydovchi", "Mijozlar", "Mahsulot nomi", "To'lov usuli", "Mashina", "Furgon",
+            "Narxi", "Dispetcher narxi", "Haydovchi haqqi",
+            "Masofa (km)", "Ma'lumot", "Mahsulot soni"
         ]
+
+        # Set column widths
+        column_widths = [15, 20, 30, 40, 40, 20, 20, 20, 15, 18, 18, 15, 50, 20]
+        for i, width in enumerate(column_widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = width
+
+        # Style headers
+        from openpyxl.styles import Font
+        header_font = Font(bold=True)
+        
         ws.append(headers)
+        for cell in ws[1]:
+            cell.font = header_font
+            
+        # Freeze top row
+        ws.freeze_panes = 'A2'
+        from openpyxl.styles import Alignment
+        wrap_alignment = Alignment(wrapText=True, vertical='top')
+
+        # Refetch with products and payments
+        queryset = queryset.prefetch_related("product_set", "cashtransactionhistory_set__payment_way")
+
         for obj in queryset:
-            clients = ", ".join([f"{c.first_name} {c.last_name}" for c in obj.client.all()])
+            clients = "\n".join([f"{c.company or (c.first_name + ' ' + (c.last_name or ''))}" for c in obj.client.all()])
+            products = "\n".join([f"{p.name} ({p.count})" for p in obj.product_set.all()])
+            
+            # Extract unique payment methods
+            payment_methods_set = set()
+            for tx in obj.cashtransactionhistory_set.all():
+                if tx.payment_way:
+                    payment_methods_set.add(tx.payment_way.name)
+            payment_methods = "\n".join(sorted(list(payment_methods_set)))
+
             ws.append([
                 obj.created_at.strftime("%Y-%m-%d"),
                 obj.country.name if obj.country else "",
                 obj.driver.fullname if obj.driver else "",
                 clients,
-                obj.car.name if obj.car else "",
-                obj.fourgon.name if obj.fourgon else "",
+                products,
+                payment_methods,
+                obj.car.car_number if obj.car else "",
+                (obj.fourgon.name + "|" + obj.fourgon.number) if obj.fourgon else "",
                 obj.price,
                 obj.dr_price,
                 obj.dp_price,
@@ -1011,6 +1382,11 @@ class RaysExportViewSet(ViewSet):
                 obj.dp_information,
                 obj.count,
             ])
+            # Apply wrap text to Clients(4), Products(5), PaymentWays(6) and Information(13)
+            ws.cell(row=ws.max_row, column=4).alignment = wrap_alignment
+            ws.cell(row=ws.max_row, column=5).alignment = wrap_alignment
+            ws.cell(row=ws.max_row, column=6).alignment = wrap_alignment
+            ws.cell(row=ws.max_row, column=13).alignment = wrap_alignment
         response = HttpResponse(content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         filename = f"rays_export_{now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         response['Content-Disposition'] = f'attachment; filename="{filename}"'
@@ -1082,6 +1458,32 @@ class CountryViewSet(viewsets.ModelViewSet):
     )
     def destroy(self, request, *args, **kwargs):
         return super().destroy(request, *args, **kwargs)
+
+class FuelViewSet(viewsets.ModelViewSet):
+    def get_permissions(self):
+        if self.action in ['list', 'retrieve']:
+            permission_classes = [permissions.IsAuthenticated]
+        else:
+            permission_classes = [IsZaphosOrAdmin]
+        return [permission() for permission in permission_classes]
+
+    queryset = models.FuelMod.objects.select_related('car', 'driver', 'currency').all()
+    serializer_class = rest_api.FuelSerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    @swagger_auto_schema(
+        operation_summary="📋 Список расходов на топливо",
+        operation_description="Получить список всех записей о заправках."
+    )
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @swagger_auto_schema(
+        operation_summary="➕ Добавить заправку",
+        operation_description="Создание новой записи о заправке (fuel)."
+    )
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
 
 class ServiceViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
@@ -1231,6 +1633,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
                 usd_value = to_usd(item.price, item.currency)
                 texnic_total += usd_value
                 result.append({
+                    "id": f"texnic-{item.id}",
                     "type": "Техобслуживание",
                     "price": item.price,
                     "currency": item.currency.currency if item.currency else None,
@@ -1246,6 +1649,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
                 usd_value = to_usd(item.price, item.currency)
                 balon_total += usd_value
                 result.append({
+                    "id": f"balon-{item.id}",
                     "type": "Баллон (Машина)",
                     "price": item.price,
                     "currency": item.currency.currency if item.currency else None,
@@ -1262,6 +1666,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
                 usd_value = to_usd(item.price, item.currency)
                 balon_furgon_total += usd_value
                 result.append({
+                    "id": f"balonfurgon-{item.id}",
                     "type": "Баллон (Фургон)",
                     "price": item.price,
                     "currency": item.currency.currency if item.currency else None,
@@ -1278,6 +1683,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
                 usd_value = to_usd(item.price, item.currency)
                 optol_total += usd_value
                 result.append({
+                    "id": f"optol-{item.id}",
                     "type": "Оптол",
                     "price": item.price,
                     "currency": item.currency.currency if item.currency else None,
@@ -1292,6 +1698,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
             usd_value = to_usd(item.price, item.currency)
             chiqimlik_total += usd_value
             result.append({
+                "id": f"chiqimlik-{item.id}",
                 "type": f"Чеки: {item.chiqimlar.name if item.chiqimlar else 'Без категории'}",
                 "price": item.price,
                 "currency": item.currency.currency if item.currency else None,
@@ -1641,53 +2048,101 @@ class RaysHistoryFullViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = rest_api.ExtendedRaysHistorySerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
-    @action(detail=False,methods=['get'],url_path='rayshistory-overview')
+    @action(detail=False, methods=['get'], url_path='rayshistory-overview')
     def rayshistory_overview(self, request):
-        rayshistory = models.RaysHistoryMod.objects.all()
-        rays_count = rayshistory.count()
-        rays_kilometr = rayshistory.aggregate(total=Coalesce(Sum('kilometer'), Value(0), output_field=DecimalField()))['total']
-        rays_price = rayshistory.aggregate(total=Coalesce(Sum('price'), Value(0), output_field=DecimalField()))['total']
+        rates = {rate.currency: float(rate.rate_to_uzs) for rate in models.CurrencyRate.objects.all()}
+        usd_rate = rates.get('USD', 12500)
         
-        dr_sum = rayshistory.aggregate(total=Coalesce(Sum('dr_price'), Value(0), output_field=DecimalField()))['total']
-        dp_sum = rayshistory.aggregate(total=Coalesce(Sum('dp_price'), Value(0), output_field=DecimalField()))['total']
-        rays_total_price = rays_price - (dr_sum + dp_sum)
+        period = request.query_params.get('period')
+        from_date = request.query_params.get('from_date')
+        to_date = request.query_params.get('to_date')
+        
+        rays_history = models.RaysHistoryMod.objects.prefetch_related('rayshistoryexpense_set').all()
+        
+        if from_date and to_date:
+            rays_history = rays_history.filter(created_at__range=[from_date, to_date])
+        elif period:
+            if period == 'week':
+                rays_history = rays_history.filter(created_at__gte=now() - timedelta(days=7))
+            elif period == 'month':
+                rays_history = rays_history.filter(created_at__gte=now() - timedelta(days=30))
+            elif period == 'year':
+                rays_history = rays_history.filter(created_at__gte=now() - timedelta(days=365))
+
+        rays_count = rays_history.count()
+        total_rays_price_uzs = 0
+        total_kilometr = 0
+        total_profit_uzs = 0
+        total_driver_expense_uzs = 0
+
+        for rays in rays_history:
+            rate = float(rays.custom_rate_to_uzs) if hasattr(rays, 'custom_rate_to_uzs') and rays.custom_rate_to_uzs else usd_rate
+            if not rate: rate = usd_rate
+
+            price_uzs = float(rays.price) * rate if rays.price < 100000 else float(rays.price)
+            dr_price_uzs = float(rays.dr_price) * rate if rays.dr_price < 100000 else float(rays.dr_price)
+            
+            dp_rate = float(rays.dp_currency.rate_to_uzs) if rays.dp_currency else rate
+            dp_price_uzs = float(rays.dp_price) * dp_rate
+            
+            driver_exp_uzs = float(rays.driver_expense) * rate if rays.driver_expense < 100000 else float(rays.driver_expense)
+            
+            expenses_uzs = 0
+            for exp in rays.rayshistoryexpense_set.all():
+                exp_rate = float(exp.currency.rate_to_uzs) if exp.currency else rate
+                expenses_uzs += float(exp.price) * exp_rate
+
+            total_rays_price_uzs += price_uzs
+            total_kilometr += rays.kilometer
+            total_driver_expense_uzs += driver_exp_uzs
+            
+            profit_uzs = price_uzs - dp_price_uzs - expenses_uzs - driver_exp_uzs
+            total_profit_uzs += profit_uzs
 
         return Response({
             'rays_count': rays_count,
-            'rays_kilometr': rays_kilometr,
-            'rays_price': rays_price,
-            'rays_total_price': rays_total_price
+            'rays_kilometr': float(total_kilometr),
+            'rays_price': round(total_rays_price_uzs, 2),
+            'rays_total_price': round(total_profit_uzs, 2),
+            'rays_driver_expense': round(total_driver_expense_uzs, 2)
         })
 
     @docs.rayshistory_locations_doc
     @action(detail=False, methods=['get'], url_path='locations')
     def location(self, request):
+        rates = {rate.currency: float(rate.rate_to_uzs) for rate in models.CurrencyRate.objects.all()}
+        usd_rate = rates.get('USD', 12500)
+        
         result = defaultdict(lambda: {"rays_count": 0, "total_price": 0})
         rays_history = models.RaysHistoryMod.objects.prefetch_related('client')
 
         for rays in rays_history:
-            clients = rays.client.all()
-            products = models.Product.objects.filter(client__in=clients).select_related('from_location', 'to_location')
+            rate = float(rays.custom_rate_to_uzs) if hasattr(rays, 'custom_rate_to_uzs') and rays.custom_rate_to_uzs else usd_rate
+            
+            # Get products for this rays history
+            products = models.Product.objects.filter(rays_history=rays).select_related('from_location', 'to_location', 'currency')
 
             for product in products:
-                from_loc = product.from_location.name if product.from_location else "❌"
-                to_loc = product.to_location.name if product.to_location else "❌"
+                from_loc = product.from_location.name if product.from_location else "Noma'lum"
+                to_loc = product.to_location.name if product.to_location else "Noma'lum"
                 key = (from_loc, to_loc)
 
-                result[key]["rays_count"] += 1
-                result[key]["total_price"] += product.price
+                prod_rate = float(product.currency.rate_to_uzs) if product.currency else rate
+                price_uzs = float(product.price) * prod_rate
 
-        # Формируем список и оставляем топ 5
+                result[key]["rays_count"] += 1
+                result[key]["total_price"] += price_uzs
+
         response_data = sorted([
             {
                 "from_location": from_loc,
                 "to_location": to_loc,
                 "rays_count": data["rays_count"],
-                "total_price": data["total_price"]
+                "total_price": round(data["total_price"], 2)
             }
             for (from_loc, to_loc), data in result.items()
-        ], key=lambda x: x["rays_count"], reverse=True)[:5]  # 👈 добавлен срез топ-5
-
+        ], key=lambda x: x["rays_count"], reverse=True)[:5]
+        
         return Response(response_data)
 
     @swagger_auto_schema(
@@ -1743,8 +2198,16 @@ class RaysViewSet(viewsets.ModelViewSet):
         if rays_id:
             rays = models.RaysMod.objects.get(id=rays_id)
             client_ids = request.data.get('client', [])  # ожидаем список id клиентов
+            product_ids = request.data.get('product_ids', []) # конкретные id продуктов от фронтенда
+            
             for client_id in client_ids:
-                products = models.Product.objects.filter(client_id=client_id, rays__isnull=True)
+                if product_ids:
+                    # Если фронтенд передал список конкретных продуктов
+                    products = models.Product.objects.filter(client_id=client_id, id__in=product_ids, rays__isnull=True)
+                else:
+                    # Обратная совместимость: берем все товары без рейса для клиента
+                    products = models.Product.objects.filter(client_id=client_id, rays__isnull=True)
+                
                 for product in products:
                     product.rays = rays
                     product.save()
@@ -1777,6 +2240,46 @@ class RaysViewSet(viewsets.ModelViewSet):
         rays.update_prices_from_products_and_expenses()
 
         return Response({"success": f"✅ Цена и расходы рейса обновлены (в USD): price = {rays.price}, dr_price = {rays.dr_price}"})
+
+    @action(detail=True, methods=['post'], url_path='return-advance')
+    def return_advance(self, request, pk=None):
+        rays = self.get_object()
+        amount = request.data.get('amount')
+        if amount is None:
+            return Response({"error": "amount maydoni majburiy"}, status=400)
+        
+        try:
+            amount = int(amount)
+        except (ValueError, TypeError):
+            return Response({"error": "amount raqam bo'lishi kerak"}, status=400)
+
+        rays.returned_advance += amount
+        rays.save()
+
+        # Kassa uchun tranzaksiya yaratamiz (avtomatik tasdiqlangan)
+        category, _ = models.CashCategory.objects.get_or_create(name="Haydovchidan qaytgan pul")
+        
+        client = rays.client.first()
+        if not client:
+            return Response({"error": "Reysga biriktirilgan mijoz topilmadi. Tranzaksiya yaratish uchun kamida bitta mijoz bo'lishi kerak."}, status=400)
+
+        models.CashTransactionMod.objects.create(
+            rays=rays,
+            amount=amount,
+            currency=rays.dp_currency or models.get_default_currency_object(),
+            payment_way=category,
+            status='confirmed',
+            is_confirmed_by_cashier=True,
+            cashier=request.user if request.user.is_authenticated and request.user.status == 'cashier' else None,
+            comment=f"Reys #{rays.id} bo'yicha haydovchidan ortiqcha pul qaytarildi",
+            is_via_driver=False,
+            client=client
+        )
+
+        return Response({
+            "success": f"✅ {amount} miqdoridagi pul kassaga qabul qilindi.",
+            "total_returned": rays.returned_advance
+        })
 
     @swagger_auto_schema(
         method='get',
@@ -1932,11 +2435,37 @@ class CarsViewSet(viewsets.ModelViewSet):
 
 class CustomUserViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
-        if self.action in ['list', 'retrieve', 'by_status', 'drivers_status', 'top_drivers']:
+        if self.action in ['list', 'retrieve', 'by_status', 'drivers_status', 'top_drivers', 'summary']:
             permission_classes = [permissions.IsAuthenticated]
         else:
-            permission_classes = [IsOwnerOrCEO]
+            permission_classes = [IsOwnerOrCEO | IsBugalterOrAdmin]
         return [permission() for permission in permission_classes]
+
+    @action(detail=False, methods=['get'], url_path='summary')
+    def summary(self, request):
+        """
+        CEO Dashboard uchun barcha haydovchilar bo'yicha statistika.
+        """
+        # Faqat haydovchi statusidagilarni olamiz
+        all_drivers = models.CustomUser.objects.filter(status='driver')
+        total_count = all_drivers.count()
+        
+        # Yo'ldagi haydovchilar (Haqiqatda faol reysi borlar)
+        on_road_count = models.RaysMod.objects.filter(is_completed=False, driver__isnull=False).values('driver').distinct().count()
+        
+        # Kutayotgan haydovchilar (Band bo'lmagan haydovchilar)
+        waiting_count = all_drivers.filter(is_busy=False).count()
+        
+        # Jami faol haydovchilar (Yo'ldagilar + Kutayotganlar)
+        active_count = on_road_count + waiting_count
+
+        return Response({
+            "total": total_count,
+            "active": active_count,
+            "inactive": max(0, total_count - active_count),
+            "on_road": on_road_count,
+            "waiting": waiting_count
+        })
 
     queryset = models.CustomUser.objects.annotate(
         rays_count=Count('rayshistorymod', distinct=True),

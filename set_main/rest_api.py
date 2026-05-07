@@ -7,31 +7,11 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 def to_usd(amount, currency_code):
     """
-    Конвертирует сумму из указанной валюты в доллары США.
+    Passthrough since system is UZS only.
     """
     try:
-        amount = Decimal(str(amount))
-    except (InvalidOperation, TypeError, ValueError):
-        return Decimal('0.00')
-
-    if currency_code == 'USD':
-        return amount
-
-    try:
-        currency_rate = models.CurrencyRate.objects.get(currency=currency_code)
-        usd_currency = models.CurrencyRate.objects.get(currency='USD')
-        usd_rate = Decimal(str(usd_currency.rate_to_uzs))
-        
-        if usd_rate == 0:
-            return Decimal('0.00')
-
-        if currency_code == 'UZS':
-            return amount / usd_rate
-
-        # Конвертировать сначала в UZS, затем в USD
-        uzs_amount = amount * Decimal(str(currency_rate.rate_to_uzs))
-        return uzs_amount / usd_rate
-    except (models.CurrencyRate.DoesNotExist, ZeroDivisionError, InvalidOperation):
+        return Decimal(str(amount))
+    except:
         return Decimal('0.00')
             
 class CurrencySerializer(serializers.ModelSerializer):
@@ -59,6 +39,7 @@ class CashCategorySerializer(serializers.ModelSerializer):
 
 class CashTransactionSerializer(serializers.ModelSerializer):
     client_name = serializers.CharField(source='client.first_name', read_only=True)
+    client_company = serializers.CharField(source='client.company', read_only=True)
     driver_name = serializers.CharField(source='driver.fullname', read_only=True)
     product_name = serializers.CharField(source='product.name', read_only=True)
     cashier_name = serializers.CharField(source='cashier.fullname', read_only=True)
@@ -67,7 +48,7 @@ class CashTransactionSerializer(serializers.ModelSerializer):
         model = models.CashTransactionMod
         fields = [
             'id',
-            'client', 'client_name',
+            'client', 'client_name', 'client_company',
             'rays',
             'product', 'product_name',
             'driver', 'driver_name',
@@ -103,27 +84,9 @@ class CashTransactionSerializer(serializers.ModelSerializer):
         else:
             validated_data['cashier'] = user
 
-        # Получаем курс USD
-        try:
-            usd_rate = Decimal(models.CurrencyRate.objects.get(currency='USD').rate_to_uzs)
-        except models.CurrencyRate.DoesNotExist:
-            usd_rate = Decimal('1')
-
-        # ✅ Локальная функция (без self!)
-        def to_usd(value: Decimal, currency):
-            try:
-                if currency.currency == 'USD':
-                    return Decimal(value)
-                rate_to_uzs = Decimal(currency.rate_to_uzs)
-                return (Decimal(value) * rate_to_uzs) / usd_rate
-            except (models.CurrencyRate.DoesNotExist, InvalidOperation):
-                return Decimal('0')
-
-        # Оплата (amount) в валюте клиента
-        currency = validated_data.get('currency')
-        amount = Decimal(validated_data.get('amount', 0))
-        amount_in_usd = to_usd(amount, currency)
-        validated_data['amount_in_usd'] = round(amount_in_usd, 2)
+        # Система переведена на UZS. Поле amount_in_usd используется для совместимости.
+        amount_in_uzs = Decimal(validated_data.get('amount', 0))
+        validated_data['amount_in_usd'] = round(amount_in_uzs, 2)
 
         # Определяем продукты клиента
         products = models.Product.objects.filter(client=client, is_delivered=False)
@@ -133,29 +96,37 @@ class CashTransactionSerializer(serializers.ModelSerializer):
 
         if not product:
             # Нет конкретного продукта — считаем по всем
-            total_expected_usd = sum(to_usd(p.price, p.currency) for p in products)
-            past_paid_usd = models.CashTransactionMod.objects.filter(
+            if validated_data.get('total_expected_amount'):
+                # Если сумма передана явно (например, ручной ввод долга)
+                total_expected_uzs = Decimal(validated_data['total_expected_amount'])
+            else:
+                total_expected_uzs = sum(models.to_uzs(p.price, p.currency) for p in products)
+            
+            past_paid_uzs = models.CashTransactionMod.objects.filter(
                 client=client, status='pending'
             ).aggregate(total=Sum('amount_in_usd'))['total'] or Decimal('0')
 
-            total_paid_usd = past_paid_usd + amount_in_usd
+            total_paid_uzs = past_paid_uzs + amount_in_uzs
 
-            validated_data['total_expected_amount'] = round(total_expected_usd, 2)
-            validated_data['paid_amount'] = round(total_paid_usd, 2)
-            validated_data['remaining_debt'] = round(max(total_expected_usd - total_paid_usd, 0), 2)
+            validated_data['total_expected_amount'] = round(total_expected_uzs, 2)
+            validated_data['paid_amount'] = round(total_paid_uzs, 2)
+            validated_data['remaining_debt'] = round(max(total_expected_uzs - total_paid_uzs, 0), 2)
             validated_data['product'] = None  # явно укажем, что продукт не задан
         else:
             # Расчёт по конкретному продукту
-            expected_usd = to_usd(product.price, product.currency)
-            past_paid_usd = models.CashTransactionMod.objects.filter(
+            if validated_data.get('total_expected_amount'):
+                expected_uzs = Decimal(validated_data['total_expected_amount'])
+            else:
+                expected_uzs = models.to_uzs(product.price, product.currency)
+            past_paid_uzs = models.CashTransactionMod.objects.filter(
                 client=client, product=product, status='pending'
             ).aggregate(total=Sum('amount_in_usd'))['total'] or Decimal('0')
 
-            total_paid_usd = past_paid_usd + amount_in_usd
+            total_paid_uzs = past_paid_uzs + amount_in_uzs
 
-            validated_data['total_expected_amount'] = round(expected_usd, 2)
-            validated_data['paid_amount'] = round(total_paid_usd, 2)
-            validated_data['remaining_debt'] = round(max(expected_usd - total_paid_usd, 0), 2)
+            validated_data['total_expected_amount'] = round(expected_uzs, 2)
+            validated_data['paid_amount'] = round(total_paid_uzs, 2)
+            validated_data['remaining_debt'] = round(max(expected_uzs - total_paid_uzs, 0), 2)
 
         # Назначаем водителя, если есть rays и клиент в нём
         rays = validated_data.get('rays')
@@ -184,57 +155,31 @@ class ConfirmCashTransactionSerializer(serializers.ModelSerializer):
         client = validated_data.get('client', instance.client)
         product = validated_data.get('product', instance.product)
 
-        # Получаем курс USD→UZS
-        try:
-            usd_rate = Decimal(models.CurrencyRate.objects.get(currency='USD').rate_to_uzs)
-        except models.CurrencyRate.DoesNotExist:
-            usd_rate = Decimal('1')
-
-        def to_usd(value: Decimal, curr):
-            try:
-                if curr.currency == 'USD':
-                    return Decimal(value)
-                rate_to_uzs = Decimal(curr.rate_to_uzs)
-                return (Decimal(value) * rate_to_uzs) / usd_rate
-            except (models.CurrencyRate.DoesNotExist, InvalidOperation):
-                return Decimal('0')
-
-        # 1) Ожидаемая сумма по товарам
-        if product:
-            expected_usd = to_usd(product.price, product.currency)
-            past_paid_usd = (
-                models.CashTransactionMod.objects
-                .filter(client=client, product=product, status='pending')
-                .exclude(id=instance.id)
-                .aggregate(total=Sum('amount_in_usd'))['total'] or Decimal('0')
-            )
-        else:
-            prods = models.Product.objects.filter(client=client, is_delivered=False)
-            expected_usd = sum(to_usd(p.price, p.currency) for p in prods)
-            past_paid_usd = (
-                models.CashTransactionMod.objects
-                .filter(client=client, status='pending')
-                .exclude(id=instance.id)
-                .aggregate(total=Sum('amount_in_usd'))['total'] or Decimal('0')
-            )
-            instance.product = None
-
-        # 2) Конвертация текущего платежа
-        amount_in_usd = to_usd(amount, currency)
-        total_paid_usd = past_paid_usd + amount_in_usd
-
-        # 3) Остаток долга
-        remaining_debt = expected_usd - total_paid_usd
-        if remaining_debt < 0:
-            remaining_debt = Decimal('0')
-
-        # 4) Сохраняем в транзакции
+        # Система на UZS.
         instance.amount = int(amount)
         instance.currency = currency
-        instance.amount_in_usd         = amount_in_usd.quantize(Decimal('0.01'))
-        instance.total_expected_amount = expected_usd.quantize(Decimal('0.01'))
-        instance.paid_amount           = total_paid_usd.quantize(Decimal('0.01'))
+        instance.amount_in_usd = amount.quantize(Decimal('0.01'))
+
+        # Recalculate debt info
+        products = models.Product.objects.filter(client=client, is_delivered=False)
+        if product:
+            expected_uzs = models.to_uzs(product.price, product.currency)
+            past_paid_uzs = models.CashTransactionMod.objects.filter(
+                client=client, product=product, status='confirmed'
+            ).exclude(id=instance.id).aggregate(total=Sum('amount_in_usd'))['total'] or Decimal('0')
+        else:
+            expected_uzs = sum(models.to_uzs(p.price, p.currency) for p in products)
+            past_paid_uzs = models.CashTransactionMod.objects.filter(
+                client=client, status='confirmed'
+            ).exclude(id=instance.id).aggregate(total=Sum('amount_in_usd'))['total'] or Decimal('0')
+
+        total_paid_uzs = past_paid_uzs + amount
+        remaining_debt = max(expected_uzs - total_paid_uzs, 0)
+
+        instance.total_expected_amount = expected_uzs.quantize(Decimal('0.01'))
+        instance.paid_amount           = total_paid_uzs.quantize(Decimal('0.01'))
         instance.remaining_debt        = remaining_debt.quantize(Decimal('0.01'))
+        
         instance.status                = 'confirmed'
         instance.is_confirmed_by_cashier = True
         # если аноним — cashier остаётся None
@@ -249,6 +194,7 @@ class ConfirmCashTransactionSerializer(serializers.ModelSerializer):
 
 class CashTransactionHistorySerializer(serializers.ModelSerializer):
     client_name = serializers.SerializerMethodField()
+    client_company = serializers.SerializerMethodField()
     payment_name = serializers.SerializerMethodField()
     driver_name = serializers.SerializerMethodField()
     class Meta:
@@ -257,6 +203,8 @@ class CashTransactionHistorySerializer(serializers.ModelSerializer):
 
     def get_client_name(self, obj):
         return obj.client.first_name if obj.client else None
+    def get_client_company(self, obj):
+        return obj.client.company if obj.client else None
     def get_payment_name(self,obj):
         return obj.payment_way.name if obj.payment_way else None
     def get_driver_name(self, obj):
@@ -343,15 +291,14 @@ def get_driver_total_rays_usd(driver):
 class CustomUserSerializer(serializers.ModelSerializer):
     rays_count = serializers.SerializerMethodField()
     total_rays_usd = serializers.SerializerMethodField()
+    total_km = serializers.SerializerMethodField()
     token = serializers.SerializerMethodField()
 
     class Meta:
         model = models.CustomUser
         fields = [
-            'id', 'username', 'password', 'fullname', 'photo', 'phone_number', 'status', 'date',
-            'passport_series', 'passport_number', 'passport_issued_by', 'passport_issued_date',
-            'passport_birth_date', 'passport_photo_front', 'passport_photo_back', 
-            'license_number', 'license_expiry', 'is_busy', 'rays_count', 'total_rays_usd', 'token'
+            'id', 'username', 'password', 'fullname', 'phone_number', 'status', 'date',
+            'is_busy', 'rays_count', 'total_rays_usd', 'total_km', 'token'
         ]
         extra_kwargs = {
             'password': {
@@ -378,6 +325,12 @@ class CustomUserSerializer(serializers.ModelSerializer):
             if ray.price:
                 total += float(ray.price)
         return round(total, 2)
+
+    def get_total_km(self, obj):
+        from .models import RaysHistoryMod
+        from django.db.models import Sum
+        total = RaysHistoryMod.objects.filter(driver=obj).aggregate(total=Sum('kilometer'))['total'] or 0
+        return total
 
     def create(self, validated_data):
         password = validated_data.pop('password', None)
@@ -487,7 +440,7 @@ class ClientWithProductsSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = models.ClientsMod
-        fields = ['id', 'first_name', 'last_name', 'number', 'products']
+        fields = ['id', 'first_name', 'last_name', 'company', 'number', 'products']
 
     def get_products(self, obj):
         rays = self.context.get('rays')  # получаем текущий рейс из контекста
@@ -548,7 +501,7 @@ class SimpleClientSerializer(serializers.ModelSerializer):
 class SimpleCarSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.CarsMod
-        fields = ['name', 'number']
+        fields = ['name', 'car_number', 'kilometer']
 
 class SimpleFurgonSerializer(serializers.ModelSerializer):
     class Meta:
@@ -569,7 +522,7 @@ class ClientWithProductsHistorySerializer(serializers.ModelSerializer):
     products = serializers.SerializerMethodField()
     class Meta:
         model = models.ClientsMod
-        fields = ['id', 'first_name', 'last_name', 'number', 'products']
+        fields = ['id', 'first_name', 'last_name', 'company', 'number', 'products']
     def get_products(self, obj):
         rays_history = self.context.get('rays_history')
         if rays_history and hasattr(rays_history, '_prefetched_objects_cache') and 'product_set' in rays_history._prefetched_objects_cache:
@@ -590,7 +543,7 @@ class ExtendedRaysHistorySerializer(serializers.ModelSerializer):
         model = models.RaysHistoryMod
         fields = [
             'id', 'rays_id', 'country', 'driver', 'car', 'fourgon', 'client',
-            'price', 'dr_price', 'dp_price', 'driver_expense', 'dp_currency',
+            'price', 'dr_price', 'dp_price', 'driver_expense', 'returned_advance', 'dp_currency',
             'kilometer', 'dp_information', 'created_at', 'count',
             'expenses'
         ]
@@ -601,8 +554,24 @@ class ExtendedRaysHistorySerializer(serializers.ModelSerializer):
     
     def to_representation(self, instance):
         rep = super().to_representation(instance)
-        # Frontend expects these as objects, but ExtendedRaysHistorySerializer already has them as objects
-        # We just need to make sure the naming matches what the frontend expects if different
+        
+        # Main price calculation in UZS only
+        expenses = rep.get('expenses', [])
+        total_uzs = sum(float(exp['price']) for exp in expenses) if isinstance(expenses, list) else 0
+        
+        price_uzs = float(instance.price)
+        dr_price_uzs = float(instance.dr_price)
+        dp_price_uzs = float(instance.dp_price)
+        driver_exp_uzs = float(instance.driver_expense)
+
+        rep['displayPrice'] = price_uzs
+        rep['displayDrPrice'] = dr_price_uzs
+        rep['displayDpPrice'] = dp_price_uzs
+        rep['displayDriverExpense'] = driver_exp_uzs
+        rep['displayReturnedAdvance'] = float(instance.returned_advance)
+        rep['displayProfit'] = price_uzs - dp_price_uzs - float(total_uzs) - driver_exp_uzs + rep['displayReturnedAdvance']
+        rep['custom_rate_to_uzs'] = "1"
+
         return rep
 
 class RaysSerializer(serializers.ModelSerializer):
@@ -633,7 +602,7 @@ class RaysSerializer(serializers.ModelSerializer):
         model = models.RaysMod
         fields = [
             'id', 'country', 'driver', 'car', 'fourgon', 'client', 'client_completed',
-            'price', 'dr_price', 'dp_price', 'driver_expense', 'dp_currency',
+            'price', 'dr_price', 'dp_price', 'driver_expense', 'returned_advance', 'dp_currency',
             'kilometer', 'dp_information', 'created_at', 'count', 'is_completed',
             'car_data', 'fourgon_data', 'client_data', 'driver_data', 'client_completed_data', 
             'expenses', 'country_name', 'dp_currency_name'
@@ -669,7 +638,7 @@ class RaysSerializer(serializers.ModelSerializer):
         start_time = obj.created_at
 
         # Загружаем только расходы после начала рейса
-        texnics = models.Texnics.objects.filter(car=obj.car, created_at__gte=start_time)
+        texnics = models.Texnics.objects.filter(car=obj.car, created_at__gte=start_time).defer('custom_rate_to_uzs')
         balons = models.BalonMod.objects.filter(car=obj.car, created_at__gte=start_time)
         balon_furgons = models.BalonFurgon.objects.filter(furgon=obj.fourgon, created_at__gte=start_time)
         optols = models.OptolMod.objects.filter(car=obj.car, created_at__gte=start_time)
@@ -677,22 +646,19 @@ class RaysSerializer(serializers.ModelSerializer):
         arizas = models.ArizaMod.objects.filter(driver=driver, created_at__gte=start_time)
         referens = models.ReferensMod.objects.filter(driver=driver, created_at__gte=start_time)
 
-        total_usd = 0
+        total_uzs = 0
 
         def serialize_qs(qs, price_field='price', currency_field='currency'):
             result = []
-            nonlocal total_usd
+            nonlocal total_uzs
             for item in qs:
                 amount = getattr(item, price_field, 0)
-                currency_obj = getattr(item, currency_field, None)
-                currency_code = currency_obj.currency if currency_obj else 'USD'
-                usd_value = to_usd(amount, currency_code)
-                total_usd += usd_value
+                total_uzs += amount
                 result.append({
                     "id": item.id,
                     "price": amount,
-                    "currency": currency_code,
-                    "usd_value": round(usd_value, 2),
+                    "currency": "UZS",
+                    "uzs_value": amount,
                 })
             return result
 
@@ -705,7 +671,7 @@ class RaysSerializer(serializers.ModelSerializer):
             "arizalar": ArizaSerializer(arizas, many=True).data,
             "referenslar": ReferensSerializer(referens, many=True).data,
 
-            "total_usd": round(total_usd, 2)
+            "total_uzs": round(total_uzs, 2)
         }
 
     def get_car_queryset(self):
@@ -839,3 +805,12 @@ class CarDetailsSerializer(serializers.Serializer):
     optollar = OptolSerializer(many=True)
     balonlar = BalonSerializer(many=True)
     texniklar = TexSerializer(many=True)
+
+class FuelSerializer(serializers.ModelSerializer):
+    car_name = serializers.CharField(source='car.name', read_only=True)
+    driver_name = serializers.CharField(source='driver.fullname', read_only=True)
+    currency_name = serializers.CharField(source='currency.currency', read_only=True)
+
+    class Meta:
+        model = models.FuelMod
+        fields = '__all__'

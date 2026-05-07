@@ -8,12 +8,36 @@ from django.db.models.signals import post_save
 from rest_framework.exceptions import ValidationError
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 
-def get_default_currency():
+def get_default_currency_object():
     from .models import CurrencyRate
     return CurrencyRate.objects.get_or_create(
         currency='UZS',
         defaults={'rate_to_uzs': 1}
-    )[0].id
+    )[0]
+
+def get_default_currency():
+    return get_default_currency_object().id
+
+def to_uzs(amount, currency_obj) -> Decimal:
+    if amount is None or amount == 0:
+        return Decimal('0.00')
+    
+    # If currency_obj is a string (e.g., 'USD'), try to find the actual object
+    if isinstance(currency_obj, str):
+        try:
+            from .models import CurrencyRate
+            currency_obj = CurrencyRate.objects.get(currency=currency_obj)
+        except:
+            return Decimal('0.00')
+
+    if not currency_obj:
+        return Decimal(str(amount))
+
+    amount_dec = Decimal(str(amount))
+    # Use rate_to_uzs from the object
+    rate_to_uzs = Decimal(str(getattr(currency_obj, 'rate_to_uzs', 1)))
+    
+    return amount_dec * rate_to_uzs
 
 TYPE_BALON = [
     ('standart','Standart'),
@@ -99,6 +123,7 @@ class RaysHistoryMod(models.Model):
     dr_price = models.BigIntegerField(default=0)
     dp_price = models.BigIntegerField(default=0)
     driver_expense = models.BigIntegerField(default=0)
+    returned_advance = models.BigIntegerField(default=0, verbose_name="Kassaga qaytarilgan summa")
     dp_currency = models.ForeignKey(CurrencyRate, on_delete=models.SET_NULL, null=True,default=get_default_currency)
     dp_information = models.TextField(blank=True, null=True)
     country = models.ForeignKey('CountryMod', on_delete=models.SET_NULL, null=True, blank=True)
@@ -123,6 +148,7 @@ class RaysHistoryMod(models.Model):
             dr_price=self.dr_price,
             dp_price=self.dp_price,
             driver_expense=self.driver_expense,
+            returned_advance=self.returned_advance,
             kilometer=self.kilometer,
             dp_information=self.dp_information,
             count=self.count,
@@ -149,35 +175,45 @@ def archive_product(product):
     product.is_delivered = True
     product.save()
 
-def client_fully_paid_or_in_debt(client,rays):
+def client_fully_paid_or_in_debt(client, rays):
+    # Strictly target products of THIS specific trip that are not yet archived
     products = Product.objects.filter(client=client, rays=rays, is_delivered=False)
     total_product_price = products.aggregate(total=Sum('price'))['total'] or 0
+    
+    if total_product_price <= 0:
+        return True # Nothing to pay
+
+    # Target transactions of THIS specific trip or ITS products
+    q_filter = Q(rays=rays) | Q(product__rays=rays)
+
     transactions_mod = CashTransactionMod.objects.filter(
+        q_filter,
         client=client,
         status='confirmed'
-    ).filter(
-        Q(rays=rays) | Q(product__in=products)
     ).distinct()
+    
     transactions_history = CashTransactionHistory.objects.filter(
+        q_filter,
         client=client,
         status='confirmed'
-    ).filter(
-        Q(rays=rays) | Q(product__in=products)
     ).distinct()
-    # Суммируем оплаты
+
+    # Sum payments
     total_paid_mod = transactions_mod.aggregate(total=Sum('amount'))['total'] or 0
     total_paid_history = transactions_history.aggregate(total=Sum('amount'))['total'] or 0
 
     total_paid = total_paid_mod + total_paid_history
 
     if total_paid >= total_product_price:
-        return True  # всё оплачено
+        return True  # Fully paid
 
-    # Проверяем есть ли долг по этим транзакциям
-    has_debt = transactions_history.filter(is_debt=True).exists()
-    return has_debt
+    # Check for debt
+    has_debt_mod = CashTransactionMod.objects.filter(q_filter, client=client, is_debt=True, status='confirmed').exists()
+    has_debt_history = transactions_history.filter(q_filter, client=client, is_debt=True).exists()
+    return has_debt_mod or has_debt_history
 
 class RaysMod(models.Model):
+    # ... (existing fields) ...
     driver = models.ForeignKey('CustomUser', on_delete=models.SET_NULL, null=True, blank=True)
     car = models.ForeignKey('CarsMod', on_delete=models.SET_NULL, null=True, blank=True)
     fourgon = models.ForeignKey('FurgonMod', on_delete=models.SET_NULL, null=True, blank=True)
@@ -187,6 +223,7 @@ class RaysMod(models.Model):
     dr_price = models.BigIntegerField(default=0)
     dp_price = models.BigIntegerField(default=0)
     driver_expense = models.BigIntegerField(default=0)
+    returned_advance = models.BigIntegerField(default=0, verbose_name="Kassaga qaytarilgan summa")
     dp_currency = models.ForeignKey('CurrencyRate', on_delete=models.SET_NULL, null=True, blank=True,default=get_default_currency)
     dp_information = models.TextField(blank=True, null=True)
     country = models.ForeignKey('CountryMod', on_delete=models.SET_NULL, null=True, blank=True)
@@ -207,10 +244,9 @@ class RaysMod(models.Model):
         usd_rate = rates.get('USD', 1) or 1
 
         def local_to_usd(amount, currency_obj_or_code):
-            if not currency_obj_or_code:
-                return 0
+            if not amount: return 0
+            if not currency_obj_or_code: return 0
             
-            # Extract currency code if it's an object
             curr = getattr(currency_obj_or_code, 'currency', currency_obj_or_code)
             
             if curr == 'USD':
@@ -233,33 +269,47 @@ class RaysMod(models.Model):
         start_time = self.created_at
         total_usd_expenses = 0
 
-        def sum_expenses(queryset):
-            return sum(local_to_usd(item.price, getattr(item, 'currency', 'USD')) for item in queryset)
+        def get_sum(queryset):
+            s = 0
+            for item in queryset:
+                s += local_to_usd(item.price, getattr(item, 'currency', 'USD'))
+            return s
 
-        # Расчёт всех расходов (важно фильтровать по водителю, машине, фургону, времени)
-        total_usd_expenses += sum_expenses(Texnics.objects.filter(car=self.car, created_at__gte=start_time))
-        total_usd_expenses += sum_expenses(BalonMod.objects.filter(car=self.car, created_at__gte=start_time))
-        total_usd_expenses += sum_expenses(BalonFurgon.objects.filter(furgon=self.fourgon, created_at__gte=start_time))
-        total_usd_expenses += sum_expenses(OptolMod.objects.filter(car=self.car, created_at__gte=start_time))
-        total_usd_expenses += sum_expenses(ChiqimlikMod.objects.filter(driver=self.driver, created_at__gte=start_time))
+        total_usd_expenses += get_sum(Texnics.objects.filter(car=self.car, created_at__gte=start_time).defer('custom_rate_to_uzs'))
+        total_usd_expenses += get_sum(BalonMod.objects.filter(car=self.car, created_at__gte=start_time))
+        total_usd_expenses += get_sum(BalonFurgon.objects.filter(furgon=self.fourgon, created_at__gte=start_time))
+        total_usd_expenses += get_sum(OptolMod.objects.filter(car=self.car, created_at__gte=start_time))
+        total_usd_expenses += get_sum(ChiqimlikMod.objects.filter(driver=self.driver, created_at__gte=start_time))
 
         self.dr_price = round(total_usd_expenses)
         self.save()
     
-    def archive_all_transactions(self,client, rays_history):
-        all_tx = CashTransactionMod.objects.filter(client=client).filter(Q(rays=self) | Q(product__rays=self)).distinct()
+    def archive_all_transactions(self, client, rays_history):
+        # Strictly archive transactions belonging to THIS specific trip
+        all_tx = CashTransactionMod.objects.filter(client=client, rays=self).distinct()
         for tx in all_tx:
             create_history_from_transaction(tx, rays_history=rays_history)
             tx.delete()
     def __str__(self):
         return f"Rays #{self.id} - {self.driver} - {self.country}"
-    def complete_whole_race(self):
-        remaining_clients = self.client.exclude(id__in=self.client_completed.values_list('id', flat=True))
 
-        for client in remaining_clients:
-            # We no longer block completion for unpaid clients to allow smoother workflow.
-            # Unpaid amounts can be tracked via history transactions or manual entry.
-            pass
+    def complete_whole_race(self):
+        # Strictly check all clients of the trip
+        for client in self.client.all():
+            # Check if this client has fully paid or has an official debt for THIS trip
+            if not client_fully_paid_or_in_debt(client, self):
+                raise ValidationError(
+                    f"❌ Reysni yakunlab bo'lmaydi: Mijoz '{client.company or client.first_name}' hali to'lovni amalga oshirmagan yoki qarz sifatida belgilanmagan."
+                )
+
+
+        # Automatically create a DriverSalary record for the driver
+        if self.driver and self.dr_price > 0:
+            DriverSalary.objects.create(
+                driver=self.driver,
+                amount=self.dr_price,
+                currency=get_default_currency_object() # Use a helper to get actual object
+            )
 
         history = RaysHistoryMod.objects.create(
             rays_id=self.id,
@@ -271,6 +321,7 @@ class RaysMod(models.Model):
             dr_price=self.dr_price,
             dp_price=self.dp_price,
             driver_expense=self.driver_expense,
+            returned_advance=self.returned_advance,
             dp_information=self.dp_information,
             kilometer=self.kilometer,
             count=self.count
@@ -350,17 +401,6 @@ class CustomUser(AbstractBaseUser, PermissionsMixin):
     fullname = models.CharField(max_length=255)
     phone_number = models.CharField(max_length=20, blank=True, null=True)
     status = models.CharField(max_length=50, choices=STATUS_CHOICES, default='driver')
-    photo = models.ImageField(upload_to='user_photos/', blank=True, null=True, default='defaults/furgon_default.avif')
-
-    passport_series = models.CharField(max_length=4, blank=True, null=True)
-    passport_number = models.CharField(max_length=10, blank=True, null=True)
-    passport_issued_by = models.CharField(max_length=255, blank=True, null=True)
-    passport_issued_date = models.DateField(blank=True, null=True)
-    passport_birth_date = models.DateField(blank=True, null=True)
-    passport_photo_front = models.ImageField(upload_to='passport_photos/', blank=True, null=True, default='defaults/furgon_default.avif')
-    passport_photo_back = models.ImageField(upload_to='passport_photos/', blank=True, null=True, default='defaults/furgon_default.avif')
-    license_number = models.CharField(max_length=9, blank=True, null=True)
-    license_expiry = models.DateField(blank=True, null=True)
     is_busy = models.BooleanField(default=False)
 
     date = models.DateTimeField(auto_now_add=True)
@@ -492,26 +532,14 @@ class Product(models.Model):
             return
 
         try:
-            # Получаем объект USD и наш текущий курс
-            usd_obj = CurrencyRate.objects.get(currency='USD')
-            current_rate = self.currency.rate_to_uzs
+            # Получаем текущий курс
+            rate_dec = Decimal(str(self.currency.rate_to_uzs))
+            price_dec = Decimal(str(self.price))
 
-            # Конвертируем в Decimal
-            price_dec = Decimal(self.price)
-            rate_dec  = Decimal(current_rate)
-            usd_rate_dec = Decimal(usd_obj.rate_to_uzs)
+            # Конвертируем в UZS и сохраняем в поле price_in_usd (теперь там будет UZS)
+            self.price_in_usd = (price_dec * rate_dec).quantize(Decimal('0.01'))
 
-            if self.currency.currency == 'USD':
-                # Если валюта уже USD — оставляем цену без изменений
-                self.price_in_usd = price_dec
-            else:
-                # Иначе делим: цена * курс_валюты / курс_USD
-                self.price_in_usd = (price_dec * rate_dec) / usd_rate_dec
-
-            # Округление до копеек
-            self.price_in_usd = self.price_in_usd.quantize(Decimal('0.01'))
-
-        except (CurrencyRate.DoesNotExist, InvalidOperation):
+        except (AttributeError, InvalidOperation):
             # В случае проблем с курсами — обнуляем
             self.price_in_usd = Decimal('0.00')
 
@@ -529,6 +557,18 @@ class OptolMod(models.Model):
 
     def __str__(self):
         return self.car.name
+
+class FuelMod(models.Model):
+    car = models.ForeignKey(CarsMod, on_delete=models.SET_NULL, null=True, verbose_name="Машина")
+    driver = models.ForeignKey('CustomUser', on_delete=models.SET_NULL, null=True, verbose_name="Haydovchi")
+    fuel_type = models.CharField(max_length=50, verbose_name="Тип топлива")
+    liters = models.DecimalField(max_digits=10, decimal_places=2, verbose_name="Литры/Кубы")
+    price = models.BigIntegerField(verbose_name="Цена")
+    currency = models.ForeignKey(CurrencyRate, on_delete=models.SET_NULL, null=True, verbose_name="Валюта", default=get_default_currency)
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
+
+    def __str__(self):
+        return f"{self.car.name if self.car else 'Без машины'} - {self.fuel_type} ({self.liters})"
 
 class BalonFurgon(models.Model):
     type = models.CharField(max_length=100,choices=TYPE_BALON, verbose_name="Тип балона")
@@ -566,10 +606,11 @@ class Texnics(models.Model):
     price = models.BigIntegerField(verbose_name="Цена")
     currency = models.ForeignKey(CurrencyRate, on_delete=models.SET_NULL, null=True, verbose_name="Валюта",default=get_default_currency)
     kilometer = models.PositiveBigIntegerField(verbose_name="Пробег",blank=True,null=True)
+    custom_rate_to_uzs = models.DecimalField(max_digits=10, decimal_places=2, default=1.0)
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Дата создания")
 
     def __str__(self):
-        return self.car
+        return f"{self.car.name if self.car else 'Nomalum'} - {self.service.name if self.service else ''}"
  
 PAYMENT_WAY_CHOICES = [
     ('via_driver', 'Передаст водителю'),
@@ -697,4 +738,20 @@ class CashTransactionHistory(models.Model):
     is_debt = models.BooleanField(default=False, verbose_name="Клиент взял в долг")
     created_at = models.DateTimeField()
     moved_at = models.DateTimeField(auto_now_add=True)
+
+from django.db.models.signals import pre_delete
+from django.dispatch import receiver
+
+@receiver(pre_delete, sender=RaysMod)
+def free_resources_on_rays_delete(sender, instance, **kwargs):
+    if instance.car:
+        instance.car.is_busy = False
+        instance.car.save(update_fields=['is_busy'])
+    if instance.fourgon:
+        instance.fourgon.is_busy = False
+        instance.fourgon.save(update_fields=['is_busy'])
+    if instance.driver:
+        instance.driver.is_busy = False
+        instance.driver.save(update_fields=['is_busy'])
+
     # moved_at — когда была перенесена в историюllkjh;lkm,
