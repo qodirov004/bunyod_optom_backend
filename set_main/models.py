@@ -99,7 +99,7 @@ class CountryMod(models.Model):
 
 class RaysHistoryProduct(models.Model):
     name = models.CharField(max_length=255)
-    price = models.BigIntegerField()
+    price = models.BigIntegerField(default=0, blank=True)
     count = models.PositiveBigIntegerField()
     client = models.ForeignKey('ClientsMod', on_delete=models.SET_NULL, null=True)
     rays_history = models.ForeignKey('RaysHistoryMod', on_delete=models.CASCADE)
@@ -162,10 +162,59 @@ class RaysHistoryMod(models.Model):
             for product in products:
                 product.rays = rays
                 product.rays_history = None
+                product.is_delivered = False
                 product.save()
 
-        # ✅ обновляем транзакции
-        CashTransactionHistory.objects.filter(rays__id=self.id).update(rays=rays)
+        # ✅ Tranzaksiyalarni tarixdan aktiv holatga qaytaramiz
+        # Reys yakunlanganda barcha tranzaksiyalar CashTransactionHistory ga o'tkazilgan,
+        # endi ularni qaytarib CashTransactionMod ga o'tkazamiz
+        history_txs = CashTransactionHistory.objects.filter(
+            Q(rays_history=self) | Q(rays__id=self.rays_id)
+        )
+        for tx in history_txs:
+            CashTransactionMod.objects.create(
+                client=tx.client,
+                rays=rays,
+                product=tx.product,
+                driver=tx.driver,
+                amount=tx.amount,
+                amount_in_usd=tx.amount_in_usd,
+                currency=tx.currency,
+                status=tx.status,
+                payment_way=tx.payment_way,
+                is_confirmed_by_cashier=tx.is_confirmed_by_cashier,
+                cashier=tx.cashier,
+                comment=tx.comment,
+                is_debt=tx.is_debt,
+                is_via_driver=tx.is_via_driver,
+                is_delivered_to_cashier=tx.is_delivered_to_cashier,
+                total_expected_amount=tx.total_expected_amount,
+                paid_amount=tx.paid_amount,
+                remaining_debt=tx.remaining_debt,
+            )
+        # Tarixdagi tranzaksiyalarni o'chiramiz (kassadan ayriladi)
+        history_txs.delete()
+
+        # ✅ Reys yakunlanganda avtomatik yaratilgan DriverSalary ni o'chiramiz
+        if self.driver and self.dr_price > 0:
+            auto_salary = DriverSalary.objects.filter(
+                driver=self.driver,
+                amount=self.dr_price,
+                paid_at__gte=self.created_at
+            ).order_by('-paid_at').first()
+            if auto_salary:
+                auto_salary.delete()
+
+        # Mashina, furgon, haydovchini band qilamiz
+        if rays.car:
+            rays.car.is_busy = True
+            rays.car.save()
+        if rays.fourgon:
+            rays.fourgon.is_busy = True
+            rays.fourgon.save()
+        if rays.driver:
+            rays.driver.is_busy = True
+            rays.driver.save()
 
         self.delete()
         return rays
@@ -239,39 +288,42 @@ class RaysMod(models.Model):
             OptolMod, CurrencyRate
         )
 
-        # Валюты
         rates = {r.currency: float(r.rate_to_uzs) for r in CurrencyRate.objects.all()}
-        usd_rate = rates.get('USD', 1) or 1
 
+<<<<<<< HEAD
         def local_to_usd(amount, currency_obj_or_code):
             if not amount: return 0
             if not currency_obj_or_code: return 0
+=======
+        def local_to_uzs(amount, currency_obj_or_code):
+            if not amount: return 0
+            if not currency_obj_or_code: return float(amount)
+>>>>>>> c4d2074 (Excel change)
             
             curr = getattr(currency_obj_or_code, 'currency', currency_obj_or_code)
             
-            if curr == 'USD':
+            if curr == 'UZS':
                 return float(amount)
-            elif curr == 'UZS':
-                return float(amount) / usd_rate
             elif curr in rates:
-                return (float(amount) * rates[curr]) / usd_rate
-            return 0
+                return float(amount) * rates[curr]
+            return float(amount)
 
         # Продукты
-        total_usd_products = 0
+        total_uzs_products = 0
         for client in self.client.all():
             products = Product.objects.filter(client=client, rays=self, is_delivered=False)
             for product in products:
-                total_usd_products += local_to_usd(product.price, product.currency)
-        self.price = round(total_usd_products)
+                total_uzs_products += local_to_uzs(product.price, product.currency)
+        self.price = round(total_uzs_products)
 
         # Все типы расходов
         start_time = self.created_at
-        total_usd_expenses = 0
+        total_uzs_expenses = 0
 
         def get_sum(queryset):
             s = 0
             for item in queryset:
+<<<<<<< HEAD
                 s += local_to_usd(item.price, getattr(item, 'currency', 'USD'))
             return s
 
@@ -280,8 +332,18 @@ class RaysMod(models.Model):
         total_usd_expenses += get_sum(BalonFurgon.objects.filter(furgon=self.fourgon, created_at__gte=start_time))
         total_usd_expenses += get_sum(OptolMod.objects.filter(car=self.car, created_at__gte=start_time))
         total_usd_expenses += get_sum(ChiqimlikMod.objects.filter(driver=self.driver, created_at__gte=start_time))
+=======
+                s += local_to_uzs(item.price, getattr(item, 'currency', 'UZS'))
+            return s
 
-        self.dr_price = round(total_usd_expenses)
+        total_uzs_expenses += get_sum(Texnics.objects.filter(car=self.car, created_at__gte=start_time).defer('custom_rate_to_uzs'))
+        total_uzs_expenses += get_sum(BalonMod.objects.filter(car=self.car, created_at__gte=start_time))
+        total_uzs_expenses += get_sum(BalonFurgon.objects.filter(furgon=self.fourgon, created_at__gte=start_time))
+        total_uzs_expenses += get_sum(OptolMod.objects.filter(car=self.car, created_at__gte=start_time))
+        total_uzs_expenses += get_sum(ChiqimlikMod.objects.filter(driver=self.driver, created_at__gte=start_time))
+>>>>>>> c4d2074 (Excel change)
+
+        self.dr_price = round(total_uzs_expenses)
         self.save()
     
     def archive_all_transactions(self, client, rays_history):
@@ -514,7 +576,7 @@ class Product(models.Model):
     rays_history = models.ForeignKey(RaysHistoryMod, null=True, blank=True, on_delete=models.SET_NULL)
     name = models.CharField(max_length=255, verbose_name="Название товара")
     client = models.ForeignKey('ClientsMod', on_delete=models.CASCADE, null=True, blank=True, verbose_name="Клиент")
-    price = models.BigIntegerField(verbose_name="Цена")
+    price = models.BigIntegerField(verbose_name="Цена", default=0, blank=True)
     price_in_usd = models.DecimalField(max_digits=15, decimal_places=2, default=0) 
     currency = models.ForeignKey(CurrencyRate, on_delete=models.SET_NULL, null=True, verbose_name="Валюта",default=get_default_currency)
     count = models.PositiveBigIntegerField(verbose_name="Количество")

@@ -25,6 +25,9 @@ class DriverSerializer(serializers.ModelSerializer):
     class Meta:
         model = models.DriverSalary
         fields = '__all__'
+        extra_kwargs = {
+            'currency': {'required': False},
+        }
 
     def get_currency_name(self, obj):
         return getattr(obj.currency, 'currency', 'UZS')
@@ -214,9 +217,10 @@ class CashTransactionHistorySerializer(serializers.ModelSerializer):
     
 class TexnicsSerializer(serializers.ModelSerializer):
     service_name = serializers.CharField(source="service.name", read_only=True)
+    car_number = serializers.CharField(source="car.car_number", read_only=True)
     class Meta:
         model = models.Texnics
-        fields = ["service_name", "kilometer"]  # <-- to'g'rilandi
+        fields = '__all__'
 
 class RaysHistorySerializer(serializers.ModelSerializer):
     driver_name = serializers.CharField(source="driver.username", read_only=True)
@@ -453,12 +457,13 @@ class ClientWithProductsSerializer(serializers.ModelSerializer):
 
 class OptolSerializer(serializers.ModelSerializer): # Детальная информация о фургоне
     car_name = serializers.SerializerMethodField()
+    car_number = serializers.CharField(source='car.car_number', read_only=True)
     class Meta:
         model = models.OptolMod
         fields = '__all__'
     
     def get_car_name(self, obj):
-        return obj.car.name
+        return obj.car.name if obj.car else None
 
 class BolonFurgonSerializer(serializers.ModelSerializer): # Детальная информация о фургоне
     furgon_name = serializers.SerializerMethodField()
@@ -471,6 +476,7 @@ class BolonFurgonSerializer(serializers.ModelSerializer): # Детальная �
 
 class BalonSerializer(serializers.ModelSerializer):
     car_name = serializers.SerializerMethodField()
+    car_number = serializers.CharField(source='car.car_number', read_only=True)
     class Meta:
         model = models.BalonMod
         fields = '__all__'
@@ -808,9 +814,20 @@ class CarDetailsSerializer(serializers.Serializer):
 
 class FuelSerializer(serializers.ModelSerializer):
     car_name = serializers.CharField(source='car.name', read_only=True)
+<<<<<<< HEAD
+=======
+    car_number = serializers.CharField(source='car.car_number', read_only=True)
+>>>>>>> c4d2074 (Excel change)
     driver_name = serializers.CharField(source='driver.fullname', read_only=True)
     currency_name = serializers.CharField(source='currency.currency', read_only=True)
 
     class Meta:
         model = models.FuelMod
+<<<<<<< HEAD
         fields = '__all__'
+=======
+        fields = '__all__'
+        extra_kwargs = {
+            'currency': {'required': False},
+        }
+>>>>>>> c4d2074 (Excel change)

@@ -418,6 +418,7 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
 
         rates = {rate.currency: float(rate.rate_to_uzs) for rate in models.CurrencyRate.objects.all()}
         usd_rate = rates.get('USD', 1) or 1
+        dp_prices = 0.0
 
         # Фильтр для CashTransactionHistory (поле created_at)
         cashbox_filter = {}
@@ -426,17 +427,18 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
         if date_to:
             cashbox_filter['created_at__lte'] = date_to
 
+        # All payments are in UZS, sum them directly
         cashbox = models.CashTransactionHistory.objects.filter(
             is_confirmed_by_cashier=True,
             status="confirmed",
             **cashbox_filter
-        ).values('currency__currency').annotate(
-            total=Sum('amount')
         )
 
         currency_totals = {"USD": 0, "RUB": 0, "EUR": 0, "UZS": 0}
 
-        for item in cashbox:
+        # cashbox_totals queries the values for aggregation
+        cashbox_totals = cashbox.values('currency__currency').annotate(total=Sum('amount'))
+        for item in cashbox_totals:
             currency = item['currency__currency']
             amount = item['total'] or 0
             if currency in currency_totals:
@@ -463,7 +465,8 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
         if date_to:
             created_at_filter['created_at__lte'] = date_to
 
-        dp_prices = 0
+        # Service expenses - all in UZS now
+        maintenance_uzs = 0
 
         def sum_expenses(qs):
             nonlocal dp_prices
@@ -487,11 +490,11 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
             except Exception:
                 pass
 
-        sum_expenses(models.Texnics.objects.select_related('currency').all())
-        sum_expenses(models.BalonMod.objects.select_related('currency').all())
-        sum_expenses(models.BalonFurgon.objects.select_related('currency').all())
-        sum_expenses(models.OptolMod.objects.select_related('currency').all())
-        sum_expenses(models.ChiqimlikMod.objects.select_related('currency').all())
+        sum_expenses(models.Texnics.objects.all())
+        sum_expenses(models.BalonMod.objects.all())
+        sum_expenses(models.BalonFurgon.objects.all())
+        sum_expenses(models.OptolMod.objects.all())
+        sum_expenses(models.ChiqimlikMod.objects.all())
 
         # Фильтр для DriverSalary (поле paid_at)
         salary_filter = Q()
@@ -1262,38 +1265,19 @@ class RaysHistoryActionsViewSet(ViewSet):
         if not history.can_restore():
             return Response({"error": "⛔ Восстановление невозможно — прошло более 2 дней."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # создаём новый рейс
-        restored = models.RaysMod.objects.create(
-            id=history.rays_id,
-            country=history.country,
-            driver=history.driver,
-            car=history.car,
-            fourgon=history.fourgon,
-            price=history.price,
-            dr_price=history.dr_price,
-            dp_price=history.dp_price,
-            kilometer=history.kilometer,
-            dp_information=history.dp_information,
-            count=history.count,
-            is_completed=False,
-        )
-        restored.client.set(history.client.all())
+        try:
+            # restore_to_active modeli:
+            # 1. Yangi RaysMod yaratadi
+            # 2. Productlarni qaytaradi (is_delivered=False)
+            # 3. CashTransactionHistory → CashTransactionMod ga ko'chiradi (kassadan ayriladi)
+            # 4. DriverSalary ni o'chiradi
+            # 5. Mashina/Furgon/Haydovchini band qiladi
+            # 6. RaysHistoryMod ni o'chiradi
+            restored = history.restore_to_active()
+            return Response({"success": f"✅ Reys muvaffaqiyatli qaytarildi. Yangi ID: {restored.id}"})
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-        # обновляем продукты ДО удаления истории
-        products = models.Product.objects.filter(rays_history=history)
-        for product in products:
-            product.rays = restored
-            product.rays_history = None
-            product.is_delivered = False  # 👈 Сбрасываем доставку обратно
-            product.save()
-
-        # обновляем транзакции
-        models.CashTransactionHistory.objects.filter(rays__id=history.id).update(rays=restored)
-
-        # удаляем историю
-        history.delete()
-
-        return Response({"success": f"✅ Рейс успешно восстановлен с ID {restored.id}"})
     @swagger_auto_schema(operayion_summary="Rays Restore", operation_description="Use /rayshistory-actions/<id>/restore/ — Получить статус восстановление рейса")
     def list(self, request):  # 👈 вот это обязательно
         return Response({"message": "Use /rayshistory-actions/<id>/restore/ to restore a ray"})
@@ -1305,93 +1289,451 @@ class RaysExportViewSet(ViewSet):
     )
     @action(detail=False, methods=['get'], url_path='export')
     def export_excel(self, request):
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        import calendar
+
         period = request.query_params.get("period")
         from_date = request.query_params.get("from")
         to_date = request.query_params.get("to")
-        queryset = models.RaysHistoryMod.objects.select_related(
-            "country", "driver", "car", "fourgon"
-        ).prefetch_related("client").all()
+
         today = now().date()
+
+        # ── Davr aniqlash ──
         if period == "week":
-            queryset = queryset.filter(created_at__date__gte=today - timedelta(days=7))
+            start_date = today - timedelta(days=7)
+            end_date = today
         elif period == "month":
-            queryset = queryset.filter(created_at__date__gte=today.replace(day=1))
+            start_date = today.replace(day=1)
+            _, last_day = calendar.monthrange(today.year, today.month)
+            end_date = today.replace(day=last_day)
         elif period == "year":
-            queryset = queryset.filter(created_at__date__year=today.year)
+            start_date = today.replace(month=1, day=1)
+            end_date = today.replace(month=12, day=31)
         elif from_date and to_date:
             try:
-                from_dt = datetime.strptime(from_date, "%Y-%m-%d").date()
-                to_dt = datetime.strptime(to_date, "%Y-%m-%d").date()
-                queryset = queryset.filter(created_at__date__range=(from_dt, to_dt))
+                start_date = datetime.strptime(from_date, "%Y-%m-%d").date()
+                end_date = datetime.strptime(to_date, "%Y-%m-%d").date()
             except ValueError:
                 return Response({"error": "❌ Sana formati noto'g'ri. YYYY-MM-DD formatidan foydalaning"}, status=400)
+        else:
+            start_date = today.replace(day=1)
+            _, last_day = calendar.monthrange(today.year, today.month)
+            end_date = today.replace(day=last_day)
+
+        # Kunlar ro'yxati
+        num_days = (end_date - start_date).days + 1
+        days = [start_date + timedelta(days=i) for i in range(num_days)]
+
+        queryset = models.RaysHistoryMod.objects.select_related(
+            "country", "driver", "car"
+        ).prefetch_related(
+            "rayshistoryproduct_set"
+        ).filter(
+            created_at__date__range=(start_date, end_date)
+        ).order_by('created_at')
+
+        # Barcha haydovchilarni olish (reysi bo'lmaganlar ham)
+        all_drivers = models.CustomUser.objects.filter(status='driver', is_active=True).order_by('fullname')
+
+        # Har bir haydovchining oxirgi mashinasini aniqlash
+        driver_last_car = {}
+        last_rays = models.RaysHistoryMod.objects.filter(
+            driver__in=all_drivers
+        ).select_related('car', 'driver').order_by('-created_at')
+        for ray in last_rays:
+            if ray.driver_id not in driver_last_car and ray.car:
+                driver_last_car[ray.driver_id] = ray.car
+        # Aktiv reysdagi mashinani ham tekshirish
+        active_rays = models.RaysMod.objects.filter(
+            driver__in=all_drivers
+        ).select_related('car', 'driver')
+        for ray in active_rays:
+            if ray.car:
+                driver_last_car[ray.driver_id] = ray.car
+
+        # Haydovchi bo'yicha ma'lumotlar
+        driver_data = {}
+        for driver in all_drivers:
+            driver_data[driver.id] = {
+                'driver': driver,
+                'car': driver_last_car.get(driver.id),
+                'days': defaultdict(list)
+            }
+
+        for ray in queryset:
+            if not ray.driver:
+                continue
+            driver_id = ray.driver.id
+            if driver_id in driver_data:
+                if ray.car and not driver_data[driver_id]['car']:
+                    driver_data[driver_id]['car'] = ray.car
+                driver_data[driver_id]['days'][ray.created_at.date()].append(ray)
+
+        # Mijozdan naqd kelgan pul — CashTransactionHistory
+        cash_txs = models.CashTransactionHistory.objects.filter(
+            rays_history__in=queryset,
+            status='confirmed'
+        ).select_related('rays_history', 'rays_history__driver')
+
+        cash_by_driver_date = defaultdict(lambda: defaultdict(int))
+        for tx in cash_txs:
+            if tx.rays_history and tx.rays_history.driver:
+                d_id = tx.rays_history.driver.id
+                tx_date = tx.rays_history.created_at.date()
+                cash_by_driver_date[d_id][tx_date] += tx.amount
+
+        # ══════════════════════ STILLAR ══════════════════════
+        title_fill = PatternFill(start_color='1F4E79', end_color='1F4E79', fill_type='solid')
+        header_fill = PatternFill(start_color='366092', end_color='366092', fill_type='solid')
+        borish_fill = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid')
+        qaytish_fill = PatternFill(start_color='DDEBF7', end_color='DDEBF7', fill_type='solid')
+        xarajat_fill = PatternFill(start_color='FCE4D6', end_color='FCE4D6', fill_type='solid')
+        qaytgan_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
+        naqd_fill = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
+        oylik_fill = PatternFill(start_color='E1D5E7', end_color='E1D5E7', fill_type='solid')
+
+        title_font = Font(name='Arial', size=14, bold=True, color='FFFFFF')
+        header_font = Font(name='Arial', size=10, bold=True, color='FFFFFF')
+        data_font = Font(name='Arial', size=10)
+        data_bold_font = Font(name='Arial', size=10, bold=True)
+        inst_font = Font(name='Arial', size=10, italic=True)
+
+        center_align = Alignment(horizontal='center', vertical='center', wrapText=True)
+        left_align = Alignment(horizontal='left', vertical='center', wrapText=True)
+
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
+
+        # ══════════════════════ WORKBOOK ══════════════════════
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Rays Data"
-        headers = [
-            "Sana", "Davlat", "Haydovchi", "Mijozlar", "Mahsulot nomi", "To'lov usuli", "Mashina", "Furgon",
-            "Narxi", "Dispetcher narxi", "Haydovchi haqqi",
-            "Masofa (km)", "Ma'lumot", "Mahsulot soni"
+
+        # ══════════ SHEET 2: 30 KUNLIK MOLIYA VA REYSLAR ══════════
+        ws2 = wb.active
+        ws2.title = "30 KUNLIK MOLIYA VA REYSLAR"
+
+        month_names = {
+            1: "Yanvar", 2: "Fevral", 3: "Mart", 4: "Aprel",
+            5: "May", 6: "Iyun", 7: "Iyul", 8: "Avgust",
+            9: "Sentabr", 10: "Oktabr", 11: "Noyabr", 12: "Dekabr"
+        }
+        month_name = month_names.get(start_date.month, "")
+
+        # Row 1: Sarlavha
+        ws2.merge_cells(start_row=1, start_column=1, end_row=1, end_column=3 + num_days)
+        c = ws2.cell(row=1, column=1, value=f"KUNLIK JONLI JADVAL ({month_name.upper()} OYI - {start_date.year})")
+        c.font = title_font
+        c.fill = title_fill
+        c.alignment = center_align
+
+        # Row 2: Izoh
+        ws2.merge_cells(start_row=2, start_column=1, end_row=2, end_column=3 + num_days)
+        c = ws2.cell(row=2, column=1, value="Borish yoki Qaytish qatoriga 'pustoy' deb yozib ketsangiz kifoya.")
+        c.font = inst_font
+        c.alignment = center_align
+
+        # Row 4: Headerlar
+        for col_idx, hdr in enumerate(["Haydovchi F.I.O", "Davlat Raqami", "Amaliyot Turi"], 1):
+            c = ws2.cell(row=4, column=col_idx, value=hdr)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center_align
+            c.border = thin_border
+
+        for day_idx, day in enumerate(days):
+            col = 4 + day_idx
+            c = ws2.cell(row=4, column=col, value=day.strftime("%d.%m.%Y"))
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center_align
+            c.border = thin_border
+
+        # Ustun kengliklari
+        ws2.column_dimensions['A'].width = 24
+        ws2.column_dimensions['B'].width = 15
+        ws2.column_dimensions['C'].width = 28
+        for day_idx in range(num_days):
+            ws2.column_dimensions[get_column_letter(4 + day_idx)].width = 20
+
+        ws2.row_dimensions[4].height = 35
+        ws2.freeze_panes = 'D5'
+
+        # Amaliyot turlari va ranglar
+        operation_types = [
+            ("BORISH (Yo'nalish)", borish_fill, False),
+            ("QAYTISH (Yo'nalish)", qaytish_fill, False),
+            ("Yo'l xarajati berildi (-)", xarajat_fill, True),
+            ("Haydovchidan qaytgan pul (+)", qaytgan_fill, True),
+            ("Mijozdan naqd kelgan pul (+)", naqd_fill, True),
+            ("Haydovchi oyligi (Reys uchun) (-)", oylik_fill, True),
         ]
 
-        # Set column widths
-        column_widths = [15, 20, 30, 40, 40, 20, 20, 20, 15, 18, 18, 15, 50, 20]
-        for i, width in enumerate(column_widths, 1):
-            ws.column_dimensions[get_column_letter(i)].width = width
+        drivers_sorted = sorted(driver_data.values(), key=lambda x: x['driver'].fullname)
 
-        # Style headers
-        from openpyxl.styles import Font
-        header_font = Font(bold=True)
-        
-        ws.append(headers)
-        for cell in ws[1]:
-            cell.font = header_font
-            
-        # Freeze top row
-        ws.freeze_panes = 'A2'
-        from openpyxl.styles import Alignment
-        wrap_alignment = Alignment(wrapText=True, vertical='top')
+        current_row = 5
+        driver_rows = []
 
-        # Refetch with products and payments
-        queryset = queryset.prefetch_related("product_set", "cashtransactionhistory_set__payment_way")
+        for driver_info in drivers_sorted:
+            driver = driver_info['driver']
+            car = driver_info['car']
+            days_data = driver_info['days']
 
-        for obj in queryset:
-            clients = "\n".join([f"{c.company or (c.first_name + ' ' + (c.last_name or ''))}" for c in obj.client.all()])
-            products = "\n".join([f"{p.name} ({p.count})" for p in obj.product_set.all()])
-            
-            # Extract unique payment methods
-            payment_methods_set = set()
-            for tx in obj.cashtransactionhistory_set.all():
-                if tx.payment_way:
-                    payment_methods_set.add(tx.payment_way.name)
-            payment_methods = "\n".join(sorted(list(payment_methods_set)))
+            s2_start = current_row
+            driver_rows.append((driver_info, s2_start))
 
-            ws.append([
-                obj.created_at.strftime("%Y-%m-%d"),
-                obj.country.name if obj.country else "",
-                obj.driver.fullname if obj.driver else "",
-                clients,
-                products,
-                payment_methods,
-                obj.car.car_number if obj.car else "",
-                (obj.fourgon.name + "|" + obj.fourgon.number) if obj.fourgon else "",
-                obj.price,
-                obj.dr_price,
-                obj.dp_price,
-                obj.kilometer,
-                obj.dp_information,
-                obj.count,
-            ])
-            # Apply wrap text to Clients(4), Products(5), PaymentWays(6) and Information(13)
-            ws.cell(row=ws.max_row, column=4).alignment = wrap_alignment
-            ws.cell(row=ws.max_row, column=5).alignment = wrap_alignment
-            ws.cell(row=ws.max_row, column=6).alignment = wrap_alignment
-            ws.cell(row=ws.max_row, column=13).alignment = wrap_alignment
+            # Merge F.I.O (6 qator)
+            ws2.merge_cells(start_row=current_row, start_column=1, end_row=current_row + 5, end_column=1)
+            c = ws2.cell(row=current_row, column=1, value=driver.fullname)
+            c.font = data_bold_font
+            c.alignment = center_align
+
+            # Merge Davlat Raqami (6 qator)
+            ws2.merge_cells(start_row=current_row, start_column=2, end_row=current_row + 5, end_column=2)
+            c = ws2.cell(row=current_row, column=2, value=car.car_number if car else "")
+            c.font = data_font
+            c.alignment = center_align
+
+            for op_idx, (op_name, op_fill, is_bold) in enumerate(operation_types):
+                row = current_row + op_idx
+
+                # Amaliyot turi katakchasi
+                c = ws2.cell(row=row, column=3, value=op_name)
+                c.font = data_bold_font if is_bold else data_font
+                c.fill = op_fill
+                c.alignment = left_align
+                c.border = thin_border
+
+                # Kunlik ma'lumot
+                for day_idx, day in enumerate(days):
+                    col = 4 + day_idx
+                    cell = ws2.cell(row=row, column=col)
+                    cell.border = thin_border
+                    cell.alignment = center_align
+
+                    day_rays = days_data.get(day, [])
+
+                    if op_idx == 0 or op_idx == 1:  # BORISH yoki QAYTISH
+                        # Kunlik barcha reyslardan mahsulotlarni yig'ish
+                        all_products = []
+                        for r in day_rays:
+                            all_products.extend(list(r.rayshistoryproduct_set.all()))
+
+                        if all_products:
+                            # Bazani aniqlash — eng ko'p uchraydigan from_location
+                            from_counts = {}
+                            for p in all_products:
+                                if p.from_location:
+                                    from_counts[p.from_location] = from_counts.get(p.from_location, 0) + 1
+                            base = max(from_counts, key=from_counts.get) if from_counts else None
+
+                            if base:
+                                if op_idx == 0:  # BORISH — bazadan ketgan mahsulotlar
+                                    destinations = set()
+                                    for p in all_products:
+                                        if p.from_location == base and p.to_location and p.to_location != base:
+                                            destinations.add(p.to_location)
+                                    if destinations:
+                                        cell.value = ", ".join(destinations)
+                                    elif day_rays[0].country:
+                                        cell.value = day_rays[0].country.name
+                                elif op_idx == 1:  # QAYTISH — bazaga qaytgan mahsulotlar
+                                    origins = set()
+                                    for p in all_products:
+                                        if p.to_location == base and p.from_location and p.from_location != base:
+                                            origins.add(p.from_location)
+                                    if origins:
+                                        cell.value = ", ".join(origins)
+                        elif day_rays and op_idx == 0 and day_rays[0].country:
+                            cell.value = day_rays[0].country.name
+                    elif op_idx == 2:  # Yo'l xarajati
+                        total = sum(r.driver_expense for r in day_rays)
+                        if total:
+                            cell.value = total
+                    elif op_idx == 3:  # Qaytgan pul
+                        total = sum(r.returned_advance for r in day_rays)
+                        if total:
+                            cell.value = total
+                    elif op_idx == 4:  # Mijozdan naqd
+                        total = cash_by_driver_date.get(driver.id, {}).get(day, 0)
+                        if total:
+                            cell.value = total
+                    elif op_idx == 5:  # Oylik
+                        total = sum(r.dp_price for r in day_rays)
+                        if total:
+                            cell.value = total
+
+            # Birlashtirilgan katakchalar uchun border
+            for r in range(current_row, current_row + 6):
+                ws2.cell(row=r, column=1).border = thin_border
+                ws2.cell(row=r, column=2).border = thin_border
+
+            current_row += 6
+
+        # ══════════ SHEET 1: ASOSIY REYTING & BALANS ══════════
+        ws1 = wb.create_sheet("ASOSIY REYTING & BALANS", 0)
+
+        # Row 1: Sarlavha
+        ws1.merge_cells('A1:M1')
+        c = ws1.cell(row=1, column=1, value="HAYDOVCHILAR REYSLARI, OYLIKLARI VA KASSA BALANSI")
+        c.font = title_font
+        c.fill = title_fill
+        c.alignment = center_align
+
+        # Row 2: Izoh
+        ws1.merge_cells('A2:M2')
+        c = ws1.cell(row=2, column=1, value="Kunlik jadvalga 'pustoy' deb yozsangiz, asosiy jadvalda avtomat hisoblab oylikdan chegiradi.")
+        c.font = inst_font
+        c.alignment = center_align
+
+        # Row 4: Headerlar
+        headers_s1 = [
+            "T/r", "Haydovchi F.I.O", "Davlat Raqami",
+            "Jami Borish Reyslari", "Jami Qaytish Reyslari", "Jami Umumiy Reyslar",
+            "Avtomat Sanalgan Pustoylar (-)", "1 ta Reys Stavkasi",
+            "Jami Hisoblangan Oylik", "Jami Berilgan Yo'l Puli",
+            "Jami Qaytgan Ortiqcha Pul", "Mijozdan Kelgan Naqd Pul",
+            "Kassa Sof Tushumi"
+        ]
+        for col_idx, hdr in enumerate(headers_s1, 1):
+            c = ws1.cell(row=4, column=col_idx, value=hdr)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = center_align
+            c.border = thin_border
+
+        ws1.row_dimensions[4].height = 35
+
+        # Ustun kengliklari
+        for col_letter, w in {'A': 5, 'B': 24, 'C': 15, 'D': 18, 'E': 18, 'F': 18,
+                              'G': 26, 'H': 22, 'I': 22, 'J': 22, 'K': 22, 'L': 22, 'M': 22}.items():
+            ws1.column_dimensions[col_letter].width = w
+
+        ws1.freeze_panes = 'A5'
+
+        # Sheet 2 ga reference uchun
+        s2_name = "30 KUNLIK MOLIYA VA REYSLAR"
+        first_col = get_column_letter(4)       # D
+        last_col = get_column_letter(3 + num_days)
+
+        # Har bir haydovchi uchun formulalar
+        for idx, (driver_info, s2_start) in enumerate(driver_rows):
+            driver = driver_info['driver']
+            car = driver_info['car']
+            s1_row = 5 + idx
+
+            borish_r = s2_start
+            qaytish_r = s2_start + 1
+            xarajat_r = s2_start + 2
+            qaytgan_r = s2_start + 3
+            naqd_r = s2_start + 4
+            oylik_r = s2_start + 5
+
+            # A: T/r
+            c = ws1.cell(row=s1_row, column=1, value=idx + 1)
+            c.alignment = center_align
+            c.border = thin_border
+
+            # B: F.I.O
+            c = ws1.cell(row=s1_row, column=2, value=driver.fullname)
+            c.font = data_bold_font
+            c.alignment = center_align
+            c.border = thin_border
+
+            # C: Davlat Raqami
+            c = ws1.cell(row=s1_row, column=3, value=car.car_number if car else "")
+            c.alignment = center_align
+            c.border = thin_border
+
+            # D: Jami Borish Reyslari
+            c = ws1.cell(row=s1_row, column=4)
+            c.value = f"=COUNTA('{s2_name}'!{first_col}{borish_r}:{last_col}{borish_r})"
+            c.alignment = center_align
+            c.border = thin_border
+
+            # E: Jami Qaytish Reyslari
+            c = ws1.cell(row=s1_row, column=5)
+            c.value = f"=COUNTA('{s2_name}'!{first_col}{qaytish_r}:{last_col}{qaytish_r})"
+            c.alignment = center_align
+            c.border = thin_border
+
+            # F: Jami Umumiy Reyslar
+            c = ws1.cell(row=s1_row, column=6)
+            c.value = f"=D{s1_row}+E{s1_row}"
+            c.alignment = center_align
+            c.border = thin_border
+
+            # G: Avtomat Sanalgan Pustoylar
+            c = ws1.cell(row=s1_row, column=7)
+            c.value = f'=COUNTIF(\'{s2_name}\'!{first_col}{borish_r}:{last_col}{borish_r}, "*pustoy*") + COUNTIF(\'{s2_name}\'!{first_col}{qaytish_r}:{last_col}{qaytish_r}, "*pustoy*")'
+            c.alignment = center_align
+            c.border = thin_border
+
+            # H: 1 ta Reys Stavkasi (qo'lda kiritiladi)
+            c = ws1.cell(row=s1_row, column=8)
+            c.alignment = center_align
+            c.border = thin_border
+
+            # I: Jami Hisoblangan Oylik
+            c = ws1.cell(row=s1_row, column=9)
+            c.value = f"=(F{s1_row}-G{s1_row})*H{s1_row}"
+            c.alignment = center_align
+            c.border = thin_border
+
+            # J: Jami Berilgan Yo'l Puli
+            c = ws1.cell(row=s1_row, column=10)
+            c.value = f"=SUM('{s2_name}'!{first_col}{xarajat_r}:{last_col}{xarajat_r})"
+            c.alignment = center_align
+            c.border = thin_border
+
+            # K: Jami Qaytgan Ortiqcha Pul
+            c = ws1.cell(row=s1_row, column=11)
+            c.value = f"=SUM('{s2_name}'!{first_col}{qaytgan_r}:{last_col}{qaytgan_r})"
+            c.alignment = center_align
+            c.border = thin_border
+
+            # L: Mijozdan Kelgan Naqd Pul
+            c = ws1.cell(row=s1_row, column=12)
+            c.value = f"=SUM('{s2_name}'!{first_col}{naqd_r}:{last_col}{naqd_r})"
+            c.alignment = center_align
+            c.border = thin_border
+
+            # M: Kassa Sof Tushumi
+            c = ws1.cell(row=s1_row, column=13)
+            c.value = f"=(L{s1_row}+K{s1_row})-J{s1_row}-I{s1_row}"
+            c.alignment = center_align
+            c.border = thin_border
+
+        # ── Response ──
         response = HttpResponse(content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        filename = f"rays_export_{now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        
+        # Dinamik ravishda qaysi oylar ekanligini aniqlaymiz
+        months_set = []
+        curr = start_date
+        while curr <= end_date:
+            ym = (curr.year, curr.month)
+            if ym not in months_set:
+                months_set.append(ym)
+            curr += timedelta(days=1)
+
+        if len(months_set) == 1:
+            y, m = months_set[0]
+            filename = f"Reyslar_{month_names.get(m, '')}_{y}.xlsx"
+        else:
+            same_year = all(y == months_set[0][0] for y, m in months_set)
+            if same_year:
+                m_names = "-".join(month_names.get(m, "") for y, m in months_set)
+                filename = f"Reyslar_{m_names}_{months_set[0][0]}.xlsx"
+            else:
+                parts = []
+                for y, m in months_set:
+                    parts.append(f"{month_names.get(m, '')}_{y}")
+                filename = f"Reyslar_{'-'.join(parts)}.xlsx"
+
         response['Content-Disposition'] = f'attachment; filename="{filename}"'
         wb.save(response)
         return response
+
     @swagger_auto_schema(
             operation_summary="📋 Получить список экспортов",
             operation_description="Возвращает список всех экспортов.",
@@ -1656,6 +1998,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
                     "usd_value": round(usd_value, 2),
                     "car": item.car.id,
                     "car_name": item.car.name,
+                    "car_number": item.car.car_number or item.car.number,
                     'count': item.count,
                     'kilometr': item.kilometr,
                     'created_at': item.created_at
@@ -1690,6 +2033,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
                     "usd_value": round(usd_value, 2),
                     "car": item.car.id,
                     "car_name": item.car.name,
+                    "car_number": item.car.car_number or item.car.number,
                     'kilometr': item.kilometr,
                     'created_at': item.created_at
                 })
@@ -2437,6 +2781,8 @@ class CustomUserViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         if self.action in ['list', 'retrieve', 'by_status', 'drivers_status', 'top_drivers', 'summary']:
             permission_classes = [permissions.IsAuthenticated]
+        elif self.action in ['create', 'update', 'partial_update']:
+            permission_classes = [IsOwnerOrCEO | IsBugalterOrAdmin | IsCashierOrAdmin]
         else:
             permission_classes = [IsOwnerOrCEO | IsBugalterOrAdmin]
         return [permission() for permission in permission_classes]
@@ -2474,7 +2820,7 @@ class CustomUserViewSet(viewsets.ModelViewSet):
             Value(0),
             output_field=DecimalField()
         )
-    ).all()
+    ).order_by('-date')
     serializer_class = rest_api.CustomUserSerializer
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     filter_backends = [DjangoFilterBackend, SearchFilter]
