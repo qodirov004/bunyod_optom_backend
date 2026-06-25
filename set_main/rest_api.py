@@ -814,20 +814,13 @@ class CarDetailsSerializer(serializers.Serializer):
 
 class FuelSerializer(serializers.ModelSerializer):
     car_name = serializers.CharField(source='car.name', read_only=True)
-<<<<<<< HEAD
-=======
     car_number = serializers.CharField(source='car.car_number', read_only=True)
->>>>>>> c4d2074 (Excel change)
     driver_name = serializers.CharField(source='driver.fullname', read_only=True)
     currency_name = serializers.CharField(source='currency.currency', read_only=True)
 
     class Meta:
         model = models.FuelMod
-<<<<<<< HEAD
-        fields = '__all__'
-=======
         fields = '__all__'
         extra_kwargs = {
             'currency': {'required': False},
         }
->>>>>>> c4d2074 (Excel change)

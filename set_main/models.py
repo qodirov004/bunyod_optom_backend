@@ -148,12 +148,15 @@ class RaysHistoryMod(models.Model):
             dr_price=self.dr_price,
             dp_price=self.dp_price,
             driver_expense=self.driver_expense,
-            returned_advance=self.returned_advance,
+            returned_advance=0,
             kilometer=self.kilometer,
             dp_information=self.dp_information,
             count=self.count,
             is_completed=False,
         )
+        # Bypassing auto_now_add to restore original created_at
+        RaysMod.objects.filter(pk=rays.pk).update(created_at=self.created_at)
+        rays.refresh_from_db()
         rays.client.set(self.client.all())
 
         # ✅ обновляем продукты: переносим с rays_history на новый rays
@@ -165,34 +168,11 @@ class RaysHistoryMod(models.Model):
                 product.is_delivered = False
                 product.save()
 
-        # ✅ Tranzaksiyalarni tarixdan aktiv holatga qaytaramiz
-        # Reys yakunlanganda barcha tranzaksiyalar CashTransactionHistory ga o'tkazilgan,
-        # endi ularni qaytarib CashTransactionMod ga o'tkazamiz
+        # ✅ Reys tarixidan qaytganda uning barcha to'lovlarini o'chiramiz (kassadan pul ayriladi)
+        # Mijoz qaytadan to'lashi va kassadan kiritilishi kerak bo'ladi.
         history_txs = CashTransactionHistory.objects.filter(
             Q(rays_history=self) | Q(rays__id=self.rays_id)
         )
-        for tx in history_txs:
-            CashTransactionMod.objects.create(
-                client=tx.client,
-                rays=rays,
-                product=tx.product,
-                driver=tx.driver,
-                amount=tx.amount,
-                amount_in_usd=tx.amount_in_usd,
-                currency=tx.currency,
-                status=tx.status,
-                payment_way=tx.payment_way,
-                is_confirmed_by_cashier=tx.is_confirmed_by_cashier,
-                cashier=tx.cashier,
-                comment=tx.comment,
-                is_debt=tx.is_debt,
-                is_via_driver=tx.is_via_driver,
-                is_delivered_to_cashier=tx.is_delivered_to_cashier,
-                total_expected_amount=tx.total_expected_amount,
-                paid_amount=tx.paid_amount,
-                remaining_debt=tx.remaining_debt,
-            )
-        # Tarixdagi tranzaksiyalarni o'chiramiz (kassadan ayriladi)
         history_txs.delete()
 
         # ✅ Reys yakunlanganda avtomatik yaratilgan DriverSalary ni o'chiramiz
@@ -226,24 +206,24 @@ def archive_product(product):
 
 def client_fully_paid_or_in_debt(client, rays):
     # Strictly target products of THIS specific trip that are not yet archived
-    products = Product.objects.filter(client=client, rays=rays, is_delivered=False)
+    products = Product.objects.filter(client_id=client.id, rays_id=rays.id, is_delivered=False)
     total_product_price = products.aggregate(total=Sum('price'))['total'] or 0
     
     if total_product_price <= 0:
         return True # Nothing to pay
 
     # Target transactions of THIS specific trip or ITS products
-    q_filter = Q(rays=rays) | Q(product__rays=rays)
+    q_filter = Q(rays_id=rays.id) | Q(product__rays_id=rays.id)
 
     transactions_mod = CashTransactionMod.objects.filter(
         q_filter,
-        client=client,
+        client_id=client.id,
         status='confirmed'
     ).distinct()
     
     transactions_history = CashTransactionHistory.objects.filter(
         q_filter,
-        client=client,
+        client_id=client.id,
         status='confirmed'
     ).distinct()
 
@@ -257,9 +237,10 @@ def client_fully_paid_or_in_debt(client, rays):
         return True  # Fully paid
 
     # Check for debt
-    has_debt_mod = CashTransactionMod.objects.filter(q_filter, client=client, is_debt=True, status='confirmed').exists()
-    has_debt_history = transactions_history.filter(q_filter, client=client, is_debt=True).exists()
+    has_debt_mod = CashTransactionMod.objects.filter(q_filter, client_id=client.id, is_debt=True, status='confirmed').exists()
+    has_debt_history = transactions_history.filter(is_debt=True).exists()
     return has_debt_mod or has_debt_history
+
 
 class RaysMod(models.Model):
     # ... (existing fields) ...
@@ -290,15 +271,9 @@ class RaysMod(models.Model):
 
         rates = {r.currency: float(r.rate_to_uzs) for r in CurrencyRate.objects.all()}
 
-<<<<<<< HEAD
-        def local_to_usd(amount, currency_obj_or_code):
-            if not amount: return 0
-            if not currency_obj_or_code: return 0
-=======
         def local_to_uzs(amount, currency_obj_or_code):
             if not amount: return 0
             if not currency_obj_or_code: return float(amount)
->>>>>>> c4d2074 (Excel change)
             
             curr = getattr(currency_obj_or_code, 'currency', currency_obj_or_code)
             
@@ -323,16 +298,6 @@ class RaysMod(models.Model):
         def get_sum(queryset):
             s = 0
             for item in queryset:
-<<<<<<< HEAD
-                s += local_to_usd(item.price, getattr(item, 'currency', 'USD'))
-            return s
-
-        total_usd_expenses += get_sum(Texnics.objects.filter(car=self.car, created_at__gte=start_time).defer('custom_rate_to_uzs'))
-        total_usd_expenses += get_sum(BalonMod.objects.filter(car=self.car, created_at__gte=start_time))
-        total_usd_expenses += get_sum(BalonFurgon.objects.filter(furgon=self.fourgon, created_at__gte=start_time))
-        total_usd_expenses += get_sum(OptolMod.objects.filter(car=self.car, created_at__gte=start_time))
-        total_usd_expenses += get_sum(ChiqimlikMod.objects.filter(driver=self.driver, created_at__gte=start_time))
-=======
                 s += local_to_uzs(item.price, getattr(item, 'currency', 'UZS'))
             return s
 
@@ -341,14 +306,12 @@ class RaysMod(models.Model):
         total_uzs_expenses += get_sum(BalonFurgon.objects.filter(furgon=self.fourgon, created_at__gte=start_time))
         total_uzs_expenses += get_sum(OptolMod.objects.filter(car=self.car, created_at__gte=start_time))
         total_uzs_expenses += get_sum(ChiqimlikMod.objects.filter(driver=self.driver, created_at__gte=start_time))
->>>>>>> c4d2074 (Excel change)
-
         self.dr_price = round(total_uzs_expenses)
         self.save()
     
     def archive_all_transactions(self, client, rays_history):
         # Strictly archive transactions belonging to THIS specific trip
-        all_tx = CashTransactionMod.objects.filter(client=client, rays=self).distinct()
+        all_tx = CashTransactionMod.objects.filter(client_id=client.id, rays_id=self.id).distinct()
         for tx in all_tx:
             create_history_from_transaction(tx, rays_history=rays_history)
             tx.delete()
@@ -388,10 +351,13 @@ class RaysMod(models.Model):
             kilometer=self.kilometer,
             count=self.count
         )
+        # Bypassing auto_now_add to save the original created_at in history
+        RaysHistoryMod.objects.filter(pk=history.pk).update(created_at=self.created_at)
+        history.refresh_from_db()
         history.client.set(self.client.all())
 
         for client in self.client.all():
-            products = Product.objects.filter(client=client, rays=self, is_delivered=False)
+            products = Product.objects.filter(client_id=client.id, rays_id=self.id, is_delivered=False)
             for product in products:
                 RaysHistoryProduct.objects.create(
                     name=product.name,
@@ -412,9 +378,9 @@ class RaysMod(models.Model):
 
             client.save()
 
-        CashTransactionHistory.objects.filter(rays=self).update(rays_history=history)
+        CashTransactionHistory.objects.filter(rays_id=self.id).update(rays_history=history)
 
-        expenses = ChiqimlikMod.objects.filter(driver=self.driver, created_at__gte=self.created_at)
+        expenses = ChiqimlikMod.objects.filter(driver_id=self.driver_id, created_at__gte=self.created_at)
         for expense in expenses:
             RaysHistoryExpense.objects.create(
                 name=(expense.chiqimlar.name if expense.chiqimlar else 'Без категории'),

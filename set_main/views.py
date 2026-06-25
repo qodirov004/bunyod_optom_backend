@@ -512,25 +512,22 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
             salaries_usd += (amount * float(rate)) / usd_rate
 
         # Calculate payment type breakdown
-        payment_ways = models.CashTransactionHistory.objects.filter(
-            is_confirmed_by_cashier=True,
-            status="confirmed",
-            **cashbox_filter
-        ).values('payment_way__name').annotate(total=Sum('amount'))
-
-        naqd_total = 0
-        bank_total = 0
-        for p in payment_ways:
-            name = (p['payment_way__name'] or '').lower()
-            amount = float(p['total'] or 0)
-            # This is a simplified logic, adjust based on your actual categories
-            if 'naqd' in name or 'cash' in name or 'haydovchi' in name:
-                naqd_total += amount * usd_rate # Assuming base unit or convert correctly
+        naqd_total = 0.0
+        bank_total = 0.0
+        for tx in cashbox.select_related('payment_way', 'currency'):
+            name = (tx.payment_way.name if tx.payment_way else '').lower()
+            amount = float(tx.amount or 0)
+            
+            rate = float(rates.get(tx.currency.currency, 1.0)) if tx.currency else 1.0
+            if tx.currency and tx.currency.currency == 'USD':
+                amount_uzs = amount * usd_rate
             else:
-                bank_total += amount * usd_rate
-
-        # Ensure naqd/bank are roughly correct relative to total_in_uzs
-        # (This logic is for UI representation)
+                amount_uzs = amount * rate
+                
+            if 'naqd' in name or 'cash' in name or 'haydovchi' in name:
+                naqd_total += amount_uzs
+            else:
+                bank_total += amount_uzs
         
         # Sum driver_expense from RaysMod and RaysHistoryMod
         driver_expenses_uzs = 0
@@ -553,6 +550,8 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
 
         maintenance_uzs = dp_prices * usd_rate
         salaries_uzs = salaries_usd * usd_rate
+
+        # Calculate remaining balance (driver_expenses_uzs only decreases Qolgan balans)
         total_exp_uzs = maintenance_uzs + salaries_uzs + driver_expenses_uzs
         remaining_balance_uzs = total_in_uzs - total_exp_uzs
 
@@ -565,8 +564,8 @@ class CashTransactionViewSet(viewsets.ModelViewSet):
                 **currency_totals,
                 "total_in_usd": round(total_in_usd, 2),
                 "total_in_uzs": round(total_in_uzs, 2),
-                "naqd_uzs": round(total_in_uzs * 0.85, 2), # Fallback representation
-                "bank_uzs": round(total_in_uzs * 0.15, 2),
+                "naqd_uzs": round(naqd_total, 2),
+                "bank_uzs": round(bank_total, 2),
                 "remaining_balance_uzs": round(remaining_balance_uzs, 2)
             },
             "expenses": {
@@ -2647,7 +2646,7 @@ class RaysViewSet(viewsets.ModelViewSet):
             rays_history = rays.complete_whole_race()
 
             # Обновляем все связанные продукты
-            products = models.Product.objects.filter(rays=rays)
+            products = models.Product.objects.filter(rays_id=rays.id)
             for product in products:
                 product.rays_history = rays_history  # ✅ правильный тип
                 product.rays = None
